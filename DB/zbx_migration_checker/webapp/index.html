@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Zabbix 6 → 7 | Migration Checker</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">Z</div><div><strong>Migration Checker</strong><span>Zabbix 6 → 7</span></div></div>
+    <nav id="nav">
+      <button data-view="overview" class="active">Visão geral</button>
+      <button data-view="recommendations">Ajustes recomendados <span id="recBadge" class="badge"></span></button>
+      <button data-view="templates">Templates base <span class="badge">Top 20</span></button>
+      <button data-view="items">Itens</button>
+      <button data-view="lld">Discoveries / LLD</button>
+      <button data-view="lld-rules">Regras LLD</button>
+      <button data-view="roots">Causas raiz</button>
+      <button data-view="hosts">Hosts</button>
+    </nav>
+    <div class="side-foot">Somente leitura<br><span id="dbVersion">Zabbix 7</span></div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div><h1 id="pageTitle">Visão geral</h1><p id="pageSubtitle">Validação pós-upgrade com o Zabbix 6 como baseline.</p></div>
+      <div class="top-actions"><button id="refreshBtn" class="secondary">Atualizar</button></div>
+    </header>
+
+    <section id="view-overview" class="view active">
+      <div id="migrationStatus" class="migration-status skeleton"></div>
+      <div id="cards" class="cards"></div>
+      <article class="panel template-priority-panel"><div class="panel-head"><h2>Top 20 templates base para corrigir</h2><span>Prioridade por severidade + impacto</span></div><div id="templateChart" class="chart template-chart"></div></article>
+      <div class="grid two">
+        <article class="panel"><div class="panel-head"><h2>Regressões por categoria</h2><span>Itens do baseline</span></div><div id="categoryChart" class="chart"></div></article>
+        <article class="panel"><div class="panel-head"><h2>Hosts mais impactados</h2><span>Top 15</span></div><div id="hostChart" class="chart"></div></article>
+      </div>
+      <div class="grid two">
+        <article class="panel"><div class="panel-head"><h2>Perdas em LLD</h2><span>Grupos acima do threshold</span></div><div id="lldChart" class="chart"></div></article>
+        <article class="panel"><div class="panel-head"><h2>Motivos de perda dos filhos LLD</h2><span>Filhos do baseline</span></div><div id="lldReasonChart" class="chart"></div></article>
+      </div>
+      <article class="panel"><div class="panel-head"><h2>Erros mais recorrentes</h2><span>Itens que regrediram</span></div><div id="errorList" class="error-list"></div></article>
+    </section>
+
+    <section id="view-recommendations" class="view">
+      <div class="section-intro"><p>Fila priorizada de intervenções sugeridas a partir dos dados encontrados. As recomendações são indicativas; valide a intenção da configuração antes de alterar o ambiente.</p></div>
+      <div id="recommendationsList" class="recommendations"></div>
+    </section>
+
+
+    <section id="view-templates" class="view">
+      <div class="section-intro"><p>O template base é resolvido seguindo a cadeia <code>items.templateid</code> até a origem. A classificação prioriza perda total de LLD, objetos CRITICAL/HIGH e volume total impactado. Use esta tela para atacar primeiro causas comuns no template, em vez de corrigir host por host.</p></div>
+      <div id="templateFilters" class="filters"></div>
+      <div class="panel table-panel"><div id="templatesMeta" class="table-meta"></div><div class="table-wrap"><table id="templatesTable"></table></div><div id="templatesPager" class="pager"></div></div>
+    </section>
+
+    <section id="view-items" class="view">
+      <div id="itemFilters" class="filters"></div>
+      <div class="panel table-panel"><div id="itemsMeta" class="table-meta"></div><div class="table-wrap"><table id="itemsTable"></table></div><div id="itemsPager" class="pager"></div></div>
+    </section>
+
+    <section id="view-lld" class="view">
+      <div id="lldFilters" class="filters"></div>
+      <div class="panel table-panel"><div id="lldMeta" class="table-meta"></div><div class="table-wrap"><table id="lldTable"></table></div><div id="lldPager" class="pager"></div></div>
+    </section>
+
+    <section id="view-lld-rules" class="view">
+      <div id="lldRuleFilters" class="filters"></div>
+      <div class="panel table-panel"><div id="lldRuleMeta" class="table-meta"></div><div class="table-wrap"><table id="lldRuleTable"></table></div><div id="lldRulePager" class="pager"></div></div>
+    </section>
+
+    <section id="view-roots" class="view"><div class="section-intro"><p>Master items em regressão que possuem dependentes também afetados. Corrigir estes objetos primeiro tende a reduzir o volume de alarmes derivados.</p></div><div class="panel table-panel"><div id="rootsMeta" class="table-meta"></div><div class="table-wrap"><table id="rootsTable"></table></div></div></section>
+
+    <section id="view-hosts" class="view"><div id="hostFilters" class="filters"></div><div class="panel table-panel"><div id="hostsMeta" class="table-meta"></div><div class="table-wrap"><table id="hostsTable"></table></div><div id="hostsPager" class="pager"></div></div></section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

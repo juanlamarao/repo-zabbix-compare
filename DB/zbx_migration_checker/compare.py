@@ -13,6 +13,7 @@ from .config import ReportConfig
 from .db import MySQLDatabase, chunks
 from .logic import classify_item, classify_lld_rule, loss_severity, structural_diff
 from .snapshot import DISCOVERY_COLUMNS, ITEM_COLUMNS, open_sqlite, read_metadata
+from .templates import enrich_template_groups
 
 LOG = logging.getLogger(__name__)
 
@@ -661,6 +662,7 @@ def export_csvs(conn: sqlite3.Connection, output_dir: Path, write_lld_child_deta
     _write_csv(conn, "lld_rule_anomalies", output_dir / "lld_rule_regressions.csv", order_by="CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 WHEN 'WARNING' THEN 1 ELSE 0 END DESC, host, itemid")
     _write_csv(conn, "lld_summary", output_dir / "lld_loss_summary.csv", order_by="CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 WHEN 'WARNING' THEN 1 ELSE 0 END DESC, loss_pct DESC")
     _write_csv(conn, "host_summary", output_dir / "host_summary.csv", order_by="anomaly_count DESC")
+    _write_csv(conn, "template_summary", output_dir / "template_summary.csv", order_by="rank ASC")
     if write_lld_child_details:
         _write_csv(conn, "lld_child_anomalies", output_dir / "lld_child_anomalies.csv", order_by="ruleid, reason, itemid")
 
@@ -712,6 +714,7 @@ def compare_snapshot_to_current(
         _analyze_lld_counts(conn, report_cfg)
         _enrich_dependency_roots(conn)
         _build_host_summary(conn)
+        enrich_template_groups(conn, baseline_alias="baseline")
 
         summary = {
             "baseline_item_count": conn.execute("SELECT COUNT(*) FROM baseline.items").fetchone()[0],
@@ -721,6 +724,7 @@ def compare_snapshot_to_current(
             "lld_groups_with_loss": conn.execute("SELECT COUNT(*) FROM lld_summary WHERE category <> 'OK'").fetchone()[0],
             "lld_total_loss": conn.execute("SELECT COUNT(*) FROM lld_summary WHERE category='LLD_TOTAL_LOSS'").fetchone()[0],
             "hosts_impacted": conn.execute("SELECT COUNT(DISTINCT hostid) FROM anomalies").fetchone()[0],
+            "templates_impacted": conn.execute("SELECT COUNT(*) FROM template_summary").fetchone()[0],
             "categories": {row[0]: row[1] for row in conn.execute("SELECT category,COUNT(*) FROM anomalies GROUP BY category ORDER BY COUNT(*) DESC")},
             "lld_rule_categories": {row[0]: row[1] for row in conn.execute("SELECT category,COUNT(*) FROM lld_rule_anomalies GROUP BY category ORDER BY COUNT(*) DESC")},
         }

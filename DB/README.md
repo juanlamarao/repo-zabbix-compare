@@ -235,3 +235,90 @@ ORDER BY ruleid, itemid;
 - Evite usar usuário `root` do MySQL.
 - Em produção, monitore tempo das consultas e I/O durante o primeiro snapshot.
 - Para um ambiente com milhões de itens, prefira rodar o snapshot contra uma réplica de leitura se houver uma disponível.
+
+## Frontend web pós-migração
+
+Depois de executar `compare` ou `run`, use o `comparison_results.sqlite` gerado para abrir o dashboard interativo:
+
+```bash
+python -m zbx_migration_checker serve \
+  --results reports/pos-upgrade/comparison_results.sqlite
+```
+
+Abra no navegador:
+
+```text
+http://127.0.0.1:8088
+```
+
+Para acessar a partir de outra máquina na rede:
+
+```bash
+python -m zbx_migration_checker serve \
+  --results reports/pos-upgrade/comparison_results.sqlite \
+  --host 0.0.0.0 \
+  --port 8088
+```
+
+> O servidor web é somente leitura e consulta apenas o `comparison_results.sqlite`. Ele não se conecta nem altera o banco do Zabbix. Por padrão escuta somente em `127.0.0.1`. Se usar `0.0.0.0`, proteja o acesso com firewall ou reverse proxy/autenticação, porque o frontend não implementa login próprio.
+
+### O que o frontend mostra
+
+- visão executiva da migração;
+- quantidade de regressões e hosts impactados;
+- categorias de erro mais frequentes;
+- top hosts com maior concentração de regressões;
+- perda de filhos por discovery/LLD;
+- itens `Not discovered`, `Pending delete`, desabilitados e pendentes de desabilitação;
+- erros de coleta mais recorrentes;
+- tabela filtrável de itens em regressão;
+- tabela de discoveries com percentual de perda e perda operacional;
+- regras LLD quebradas;
+- master items que concentram dependent items afetados;
+- fila priorizada de **Ajustes recomendados** (`P0`, `P1`, `P2`) gerada a partir das evidências da comparação.
+
+A aba de ajustes prioriza causa raiz. Por exemplo, se um master item está quebrado e possui centenas de dependentes em regressão, o frontend recomenda corrigir o master antes dos filhos. Discoveries com perda total, regras LLD quebradas e objetos marcados para deleção recebem prioridade maior.
+
+## v0.3.0 — agrupamento por template base
+
+A versão 0.3 adiciona uma visão de priorização por **template base**. A origem é resolvida exclusivamente pelo snapshot do Zabbix 6, seguindo recursivamente `items.templateid` até o item raiz. Dessa forma, uma cadeia como `host -> template composto -> template base` é agrupada pelo template base real.
+
+A tela **Templates base** apresenta, por template:
+
+- posição no ranking de prioridade;
+- quantidade de hosts afetados;
+- regressões de itens;
+- objetos CRITICAL/HIGH/WARNING;
+- regras LLD quebradas;
+- LLDs com perda e perda total;
+- filhos LLD perdidos;
+- filhos com deleção pendente;
+- dependentes afetados;
+- impacto total calculado.
+
+O dashboard principal também exibe **Top 20 templates base para corrigir**. A ordenação dá prioridade, nesta ordem geral, a perda total de LLD, criticidade e volume impactado. O ranking é uma ferramenta de triagem; a intenção da configuração deve ser validada antes de qualquer alteração.
+
+### Atualizar um resultado v0.2 sem consultar novamente os bancos Zabbix
+
+Se você já possui o snapshot do Zabbix 6 e o `comparison_results.sqlite`, não precisa repetir a coleta dos bancos. Execute:
+
+```bash
+python -m zbx_migration_checker enrich-templates \
+  --baseline data/zabbix6_baseline.sqlite \
+  --results reports/pos-upgrade/comparison_results.sqlite
+```
+
+O comando altera somente o SQLite local de resultados e cria também:
+
+```text
+template_summary.csv
+```
+
+Depois inicie normalmente o frontend:
+
+```bash
+python -m zbx_migration_checker serve \
+  --results reports/pos-upgrade/comparison_results.sqlite
+```
+
+Em novas execuções do comando `compare`, o enriquecimento de templates já ocorre automaticamente.

@@ -11,6 +11,8 @@ from .db import MySQLDatabase
 from .compare import compare_snapshot_to_current
 from .report import generate_html
 from .snapshot import create_snapshot
+from .templates import enrich_existing_results
+from .web import add_serve_parser
 
 LOG = logging.getLogger(__name__)
 
@@ -94,6 +96,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_enrich_templates(args: argparse.Namespace) -> int:
+    result = enrich_existing_results(args.results, args.baseline)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="zbx-db-migration-checker",
@@ -124,6 +133,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default=f"reports/run-{datetime.now():%Y%m%d-%H%M%S}")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("enrich-templates", help="Adiciona agrupamento por template base a um resultado já existente")
+    p.add_argument("--baseline", required=True, help="Snapshot SQLite do Zabbix 6 usado como baseline")
+    p.add_argument("--results", required=True, help="comparison_results.sqlite ou diretório do relatório")
+    p.set_defaults(func=cmd_enrich_templates)
+
+    add_serve_parser(sub)
     return parser
 
 
