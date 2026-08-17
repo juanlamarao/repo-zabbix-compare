@@ -4,8 +4,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Sequence
 
-import pymysql
-from pymysql.cursors import DictCursor, SSDictCursor
+try:
+    import pymysql
+    from pymysql.cursors import DictCursor, SSDictCursor
+except ImportError:  # allows offline unit tests that use a fake DB adapter
+    pymysql = None
+    DictCursor = SSDictCursor = object
 
 from .config import DBConfig
 
@@ -36,7 +40,18 @@ def chunks(values: Iterable[int], size: int) -> Iterator[list[int]]:
 
 
 class MySQLDatabase:
+    """Read-only accessor for a Zabbix MySQL/MariaDB database.
+
+    Important design choice in v0.4: item existence/configuration is fetched from
+    `items` first, then runtime/interface information is fetched separately and
+    merged by the relevant primary key. This makes it impossible for a runtime
+    or interface join to accidentally make an existing item look missing and it
+    also prevents errors from one object being associated with another item.
+    """
+
     def __init__(self, cfg: DBConfig):
+        if pymysql is None:
+            raise RuntimeError("PyMySQL não está instalado. Execute: pip install -r requirements.txt")
         self.cfg = cfg
         ssl = {"ca": cfg.ssl_ca} if cfg.ssl_ca else None
         self.conn = pymysql.connect(
@@ -110,7 +125,12 @@ class MySQLDatabase:
             return f"{alias}.`{column}` AS `{out}`"
         return f"NULL AS `{out}`"
 
-    def item_select_sql(self, item_ids_count: int | None = None) -> str:
+    def _core_item_select_sql(self, item_ids_count: int | None = None) -> str:
+        """Fetch item identity/configuration and host data only.
+
+        No item_rtdata/interface tables are joined here. An item that exists in
+        `items` therefore always comes back from this query.
+        """
         s = self.schema
         select = [
             self._col(s, "items", "i", "itemid"),
@@ -131,8 +151,6 @@ class MySQLDatabase:
             self._col(s, "hosts", "h", "name", "host_name"),
             self._col(s, "hosts", "h", "status", "host_status"),
         ]
-
-        # Zabbix versions differ in how proxy assignment is represented.
         if s.has_column("hosts", "proxy_hostid"):
             select.append("h.proxy_hostid AS proxy_ref")
         elif s.has_column("hosts", "proxyid"):
@@ -140,94 +158,180 @@ class MySQLDatabase:
         else:
             select.append("NULL AS proxy_ref")
 
-        joins = ["LEFT JOIN hosts h ON h.hostid = i.hostid"]
-
-        # Runtime item state/error moved across schemas over Zabbix history.
-        # Prefer item_rtdata when available, but fall back to items.* if a
-        # particular patch level keeps either field there.
-        if s.has_table("item_rtdata") and s.has_column("item_rtdata", "itemid"):
-            joins.append("LEFT JOIN item_rtdata rt ON rt.itemid = i.itemid")
-            if s.has_column("item_rtdata", "state"):
-                select.append("rt.state AS rt_state")
-            elif s.has_column("items", "state"):
-                select.append("i.state AS rt_state")
-            else:
-                select.append("NULL AS rt_state")
-            if s.has_column("item_rtdata", "error"):
-                select.append("rt.error AS rt_error")
-            elif s.has_column("items", "error"):
-                select.append("i.error AS rt_error")
-            else:
-                select.append("NULL AS rt_error")
-        else:
-            select.append("i.state AS rt_state" if s.has_column("items", "state") else "NULL AS rt_state")
-            select.append("i.error AS rt_error" if s.has_column("items", "error") else "NULL AS rt_error")
-
-        # Static interface data and runtime availability are schema-adaptive.
-        can_join_interface = (
-            s.has_table("interface")
-            and s.has_column("interface", "interfaceid")
-            and s.has_column("items", "interfaceid")
-        )
-        if can_join_interface:
-            joins.append("LEFT JOIN interface inf ON inf.interfaceid = i.interfaceid")
-            select.append(self._col(s, "interface", "inf", "type", "interface_type"))
-            select.append(self._col(s, "interface", "inf", "ip", "interface_ip"))
-            select.append(self._col(s, "interface", "inf", "dns", "interface_dns"))
-            select.append(self._col(s, "interface", "inf", "port", "interface_port"))
-
-            if s.has_table("interface_rtdata") and s.has_column("interface_rtdata", "interfaceid"):
-                joins.append("LEFT JOIN interface_rtdata irt ON irt.interfaceid = i.interfaceid")
-                if s.has_column("interface_rtdata", "available"):
-                    select.append("irt.available AS interface_available")
-                elif s.has_column("interface", "available"):
-                    select.append("inf.available AS interface_available")
-                else:
-                    select.append("NULL AS interface_available")
-                if s.has_column("interface_rtdata", "error"):
-                    select.append("irt.error AS interface_error")
-                elif s.has_column("interface", "error"):
-                    select.append("inf.error AS interface_error")
-                else:
-                    select.append("NULL AS interface_error")
-            else:
-                select.append(self._col(s, "interface", "inf", "available", "interface_available"))
-                select.append(self._col(s, "interface", "inf", "error", "interface_error"))
-        else:
-            select.extend(
-                [
-                    "NULL AS interface_type",
-                    "NULL AS interface_ip",
-                    "NULL AS interface_dns",
-                    "NULL AS interface_port",
-                    "NULL AS interface_available",
-                    "NULL AS interface_error",
-                ]
-            )
-
         where = ""
         if item_ids_count is not None:
             where = " WHERE i.itemid IN (" + ",".join(["%s"] * item_ids_count) + ")"
+        return "SELECT " + ", ".join(select) + " FROM items i LEFT JOIN hosts h ON h.hostid=i.hostid" + where
 
-        return "SELECT " + ", ".join(select) + " FROM items i " + " ".join(joins) + where
+    def _fetch_rtdata(self, item_ids: Sequence[int]) -> dict[int, dict[str, Any]]:
+        s = self.schema
+        if not item_ids:
+            return {}
+        table = None
+        alias = "rt"
+        if s.has_table("item_rtdata") and s.has_column("item_rtdata", "itemid"):
+            table = "item_rtdata"
+            state_expr = "rt.state AS rt_state" if s.has_column("item_rtdata", "state") else "NULL AS rt_state"
+            error_expr = "rt.error AS rt_error" if s.has_column("item_rtdata", "error") else "NULL AS rt_error"
+        else:
+            # Older/odd schemas may keep runtime fields on items itself.
+            table = "items"
+            alias = "rt"
+            state_expr = "rt.state AS rt_state" if s.has_column("items", "state") else "NULL AS rt_state"
+            error_expr = "rt.error AS rt_error" if s.has_column("items", "error") else "NULL AS rt_error"
+
+        placeholders = ",".join(["%s"] * len(item_ids))
+        sql = f"SELECT {alias}.itemid AS itemid,{state_expr},{error_expr} FROM {table} {alias} WHERE {alias}.itemid IN ({placeholders})"
+        out: dict[int, dict[str, Any]] = {}
+        with self.conn.cursor() as cur:
+            cur.execute(sql, list(item_ids))
+            for row in cur.fetchall():
+                out[int(row["itemid"])] = {"rt_state": row.get("rt_state"), "rt_error": row.get("rt_error")}
+        return out
+
+    def _fetch_interfaces(self, interface_ids: Sequence[int]) -> dict[int, dict[str, Any]]:
+        s = self.schema
+        ids = sorted({int(x) for x in interface_ids if x not in (None, 0)})
+        if not ids or not (s.has_table("interface") and s.has_column("interface", "interfaceid")):
+            return {}
+
+        select = [
+            "inf.interfaceid AS interfaceid",
+            self._col(s, "interface", "inf", "type", "interface_type"),
+            self._col(s, "interface", "inf", "ip", "interface_ip"),
+            self._col(s, "interface", "inf", "dns", "interface_dns"),
+            self._col(s, "interface", "inf", "port", "interface_port"),
+        ]
+        join = ""
+        if s.has_table("interface_rtdata") and s.has_column("interface_rtdata", "interfaceid"):
+            join = " LEFT JOIN interface_rtdata irt ON irt.interfaceid=inf.interfaceid"
+            if s.has_column("interface_rtdata", "available"):
+                select.append("irt.available AS interface_available")
+            elif s.has_column("interface", "available"):
+                select.append("inf.available AS interface_available")
+            else:
+                select.append("NULL AS interface_available")
+            if s.has_column("interface_rtdata", "error"):
+                select.append("irt.error AS interface_error")
+            elif s.has_column("interface", "error"):
+                select.append("inf.error AS interface_error")
+            else:
+                select.append("NULL AS interface_error")
+        else:
+            select.append(self._col(s, "interface", "inf", "available", "interface_available"))
+            select.append(self._col(s, "interface", "inf", "error", "interface_error"))
+
+        placeholders = ",".join(["%s"] * len(ids))
+        sql = f"SELECT {', '.join(select)} FROM interface inf{join} WHERE inf.interfaceid IN ({placeholders})"
+        out: dict[int, dict[str, Any]] = {}
+        with self.conn.cursor() as cur:
+            cur.execute(sql, ids)
+            for row in cur.fetchall():
+                # interfaceid is the merge key; even if a nonstandard schema
+                # returns duplicates, never merge by row position.
+                out[int(row["interfaceid"])] = dict(row)
+        return out
+
+    @staticmethod
+    def _empty_runtime_interface(row: dict[str, Any]) -> dict[str, Any]:
+        row.update(
+            {
+                "rt_state": None,
+                "rt_error": None,
+                "interface_type": None,
+                "interface_available": None,
+                "interface_error": None,
+                "interface_ip": None,
+                "interface_dns": None,
+                "interface_port": None,
+            }
+        )
+        return row
+
+    def fetch_items(self, item_ids: Sequence[int]) -> list[dict[str, Any]]:
+        """Fetch requested items with deterministic key-based merging.
+
+        `items.itemid` is the source of truth for existence. Runtime data is
+        merged by itemid and interface data by interfaceid, never by result-row
+        position. This fixes false ITEM_MISSING reports and cross-item error
+        attribution that can happen when a large joined result is trusted as a
+        single denormalized source.
+        """
+        if not item_ids:
+            return []
+        sql = self._core_item_select_sql(len(item_ids))
+        with self.conn.cursor() as cur:
+            cur.execute(sql, list(item_ids))
+            core_rows = [self._empty_runtime_interface(dict(r)) for r in cur.fetchall()]
+
+        # Defensive duplicate detection. items.itemid should be unique.
+        seen: set[int] = set()
+        deduped: list[dict[str, Any]] = []
+        for row in core_rows:
+            iid = int(row["itemid"])
+            if iid in seen:
+                LOG.warning("Itemid duplicado retornado pela consulta core: %s", iid)
+                continue
+            seen.add(iid)
+            deduped.append(row)
+
+        rt = self._fetch_rtdata([int(r["itemid"]) for r in deduped])
+        interfaces = self._fetch_interfaces([r.get("interfaceid") for r in deduped if r.get("interfaceid")])
+        for row in deduped:
+            iid = int(row["itemid"])
+            if iid in rt:
+                row.update(rt[iid])
+            interfaceid = row.get("interfaceid")
+            if interfaceid not in (None, 0) and int(interfaceid) in interfaces:
+                inf = interfaces[int(interfaceid)]
+                for key in (
+                    "interface_type",
+                    "interface_available",
+                    "interface_error",
+                    "interface_ip",
+                    "interface_dns",
+                    "interface_port",
+                ):
+                    row[key] = inf.get(key)
+        return deduped
 
     def stream_all_items(self, fetch_size: int = 10000) -> Iterator[dict[str, Any]]:
-        sql = self.item_select_sql()
+        """Stream all items while keeping deterministic enrichment.
+
+        Streaming directly from a large multi-table join was removed in v0.4.
+        We stream item IDs from the authoritative items table and enrich them in
+        chunks. This costs a few more indexed queries but is safer for migration
+        validation and still bounded in memory.
+        """
         with self.conn.cursor(SSDictCursor) as cur:
-            cur.execute(sql)
+            cur.execute("SELECT itemid FROM items ORDER BY itemid")
             while True:
                 rows = cur.fetchmany(fetch_size)
                 if not rows:
                     break
-                yield from rows
+                ids = [int(r["itemid"]) for r in rows]
+                fetched = self.fetch_items(ids)
+                by_id = {int(r["itemid"]): r for r in fetched}
+                for iid in ids:
+                    if iid in by_id:
+                        yield by_id[iid]
 
-    def fetch_items(self, item_ids: Sequence[int]) -> list[dict[str, Any]]:
+    def fetch_item_presence(self, item_ids: Sequence[int]) -> dict[int, dict[str, Any]]:
+        """Minimal direct existence check used by integrity diagnostics."""
         if not item_ids:
-            return []
-        sql = self.item_select_sql(len(item_ids))
+            return {}
+        placeholders = ",".join(["%s"] * len(item_ids))
+        sql = f"""
+            SELECT i.itemid,i.hostid,i.status AS item_status,i.flags,i.type AS item_type,
+                   i.value_type,i.key_ AS key_,i.name AS name,i.interfaceid,i.master_itemid,i.templateid,
+                   h.host,h.name AS host_name,h.status AS host_status
+            FROM items i
+            LEFT JOIN hosts h ON h.hostid=i.hostid
+            WHERE i.itemid IN ({placeholders})
+        """
         with self.conn.cursor() as cur:
             cur.execute(sql, list(item_ids))
-            return list(cur.fetchall())
+            return {int(r["itemid"]): dict(r) for r in cur.fetchall()}
 
     def discovery_select_sql(self, item_ids_count: int | None = None) -> str | None:
         s = self.schema
@@ -290,3 +394,52 @@ class MySQLDatabase:
         with self.conn.cursor() as cur:
             cur.execute(sql, list(host_ids))
             return list(cur.fetchall())
+
+    def fetch_host_interfaces(self, host_ids: Sequence[int]) -> list[dict[str, Any]]:
+        """Return every interface for the requested hosts, enriched with runtime state.
+
+        This is intentionally host-centric instead of item-centric.  It is used
+        to identify hosts for which *all* interfaces are failing, so item/LLD
+        regressions caused by a host-wide connectivity problem can be removed
+        from the migration regression report and shown in a dedicated screen.
+        """
+        if not host_ids:
+            return []
+        s = self.schema
+        if not (s.has_table("interface") and s.has_column("interface", "hostid")):
+            return []
+
+        select = [
+            self._col(s, "interface", "inf", "interfaceid"),
+            self._col(s, "interface", "inf", "hostid"),
+            self._col(s, "interface", "inf", "type", "interface_type"),
+            self._col(s, "interface", "inf", "main", "interface_main"),
+            self._col(s, "interface", "inf", "useip", "interface_useip"),
+            self._col(s, "interface", "inf", "ip", "interface_ip"),
+            self._col(s, "interface", "inf", "dns", "interface_dns"),
+            self._col(s, "interface", "inf", "port", "interface_port"),
+        ]
+        join = ""
+        if s.has_table("interface_rtdata") and s.has_column("interface_rtdata", "interfaceid"):
+            join = " LEFT JOIN interface_rtdata irt ON irt.interfaceid=inf.interfaceid"
+            if s.has_column("interface_rtdata", "available"):
+                select.append("irt.available AS interface_available")
+            elif s.has_column("interface", "available"):
+                select.append("inf.available AS interface_available")
+            else:
+                select.append("NULL AS interface_available")
+            if s.has_column("interface_rtdata", "error"):
+                select.append("irt.error AS interface_error")
+            elif s.has_column("interface", "error"):
+                select.append("inf.error AS interface_error")
+            else:
+                select.append("NULL AS interface_error")
+        else:
+            select.append(self._col(s, "interface", "inf", "available", "interface_available"))
+            select.append(self._col(s, "interface", "inf", "error", "interface_error"))
+
+        placeholders = ",".join(["%s"] * len(host_ids))
+        sql = f"SELECT {', '.join(select)} FROM interface inf{join} WHERE inf.hostid IN ({placeholders}) ORDER BY inf.hostid, inf.interfaceid"
+        with self.conn.cursor() as cur:
+            cur.execute(sql, list(host_ids))
+            return [dict(r) for r in cur.fetchall()]

@@ -24,6 +24,11 @@ class LogicTests(unittest.TestCase):
         baseline = {"host_status": 0, "item_status": 0, "rt_state": 0}
         self.assertEqual(classify_item(baseline, None, True), ("ITEM_MISSING", "HIGH"))
 
+    def test_current_disabled_host_is_ignored(self):
+        baseline = {"host_status": 0, "item_status": 0, "rt_state": 0}
+        current = {"host_status": 1, "item_status": 0, "rt_state": 1}
+        self.assertEqual(classify_item(baseline, current), ("IGNORE_HOST_DISABLED", "OK"))
+
     def test_host_missing(self):
         baseline = {"host_status": 0, "item_status": 0, "rt_state": 0}
         self.assertEqual(classify_item(baseline, None, False), ("HOST_MISSING", "CRITICAL"))

@@ -18,6 +18,7 @@
       <button data-view="lld-rules">Regras LLD</button>
       <button data-view="roots">Causas raiz</button>
       <button data-view="hosts">Hosts</button>
+      <button data-view="interface-hosts">Falhas de interface</button>
     </nav>
     <div class="side-foot">Somente leitura<br><span id="dbVersion">Zabbix 7</span></div>
   </aside>
@@ -70,9 +71,15 @@
       <div class="panel table-panel"><div id="lldRuleMeta" class="table-meta"></div><div class="table-wrap"><table id="lldRuleTable"></table></div><div id="lldRulePager" class="pager"></div></div>
     </section>
 
-    <section id="view-roots" class="view"><div class="section-intro"><p>Master items em regressão que possuem dependentes também afetados. Corrigir estes objetos primeiro tende a reduzir o volume de alarmes derivados.</p></div><div class="panel table-panel"><div id="rootsMeta" class="table-meta"></div><div class="table-wrap"><table id="rootsTable"></table></div></div></section>
+    <section id="view-roots" class="view"><div class="section-intro"><p>Master items em regressão que possuem dependentes também afetados. Corrigir estes objetos primeiro tende a reduzir o volume de alarmes derivados.</p></div><div class="panel table-panel"><div id="rootsMeta" class="table-meta"></div><div class="table-wrap"><table id="rootsTable"></table></div><div id="rootsPager" class="pager"></div></div></section>
 
     <section id="view-hosts" class="view"><div id="hostFilters" class="filters"></div><div class="panel table-panel"><div id="hostsMeta" class="table-meta"></div><div class="table-wrap"><table id="hostsTable"></table></div><div id="hostsPager" class="pager"></div></div></section>
+
+    <section id="view-interface-hosts" class="view">
+      <div class="section-intro"><p>Somente hosts habilitados em que <strong>nenhuma interface está sem erro</strong>. Esses hosts são isolados das regressões de itens, LLD, templates e causas raiz para não tratar falha de conectividade como regressão da migração.</p></div>
+      <div id="interfaceHostFilters" class="filters"></div>
+      <div class="panel table-panel"><div id="interfaceHostsMeta" class="table-meta"></div><div class="table-wrap"><table id="interfaceHostsTable"></table></div><div id="interfaceHostsPager" class="pager"></div></div>
+    </section>
   </main>
 
   <div id="toast" class="toast"></div>

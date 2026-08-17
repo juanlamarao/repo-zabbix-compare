@@ -6,12 +6,14 @@ Comparador **read-only** de bancos MySQL/MariaDB do Zabbix. O Zabbix 6 é a font
 
 - Itens que estavam saudáveis no Zabbix 6 e no 7 ficaram:
   - ausentes;
-  - em host ausente/desabilitado;
+  - em host ausente;
   - desabilitados;
   - `Not supported`;
   - sem `item_rtdata` correspondente.
-- Mensagem de erro atual (`item_rtdata.error`) e erro/availability da interface quando disponíveis.
-- Diferenças estruturais dos itens que apresentaram regressão: `type`, `key_`, `value_type`, `interfaceid`, `master_itemid`, `delay`, `timeout` e `snmp_oid`.
+- Mensagem de erro do item (`item_rtdata.error`) e erro/availability da interface em campos separados. O erro de interface nunca substitui o erro do item.
+- Hosts que estavam monitorados no baseline mas estão desabilitados no Zabbix 7 são excluídos da análise de regressão, inclusive das análises LLD.
+- Hosts habilitados no Zabbix 7 em que **todas as interfaces** estão com erro ou indisponíveis são isolados do relatório de regressões. Seus itens, LLDs e impactos por template não entram na fila de correção até a conectividade do host ser normalizada. Esses hosts aparecem em uma tela/CSV próprios.
+- Diferenças estruturais dos itens que apresentaram regressão: `hostid`, `type`, `key_`, `value_type`, `interfaceid`, `master_itemid`, `delay`, `timeout`, `snmp_oid` e `templateid`.
 - LLD rules que estavam saudáveis no 6 e quebraram no 7.
 - Filhos de LLD existentes no baseline 6 que no 7:
   - desapareceram;
@@ -112,6 +114,8 @@ Saídas:
 - `lld_loss_summary.csv` — perda agregada por discovery;
 - `lld_child_anomalies.csv` — filhos individuais perdidos/desabilitados;
 - `host_summary.csv` — agrupamento por host;
+- `host_interface_failures.csv` — hosts habilitados em que 100% das interfaces estão em erro/indisponíveis;
+- `host_interface_failure_details.csv` — detalhe de cada interface desses hosts e sua mensagem de erro;
 - `comparison_results.sqlite` — base completa da análise para consultas adicionais.
 
 ## Rodar 6 e 7 na mesma execução
@@ -157,6 +161,7 @@ O comparador não carrega todos os itens em RAM e não consulta as tabelas `hist
 
 - snapshot do 6: cursor MySQL server-side, gravação em lotes no SQLite;
 - comparação do 7: busca somente os `itemid`s presentes no snapshot 6, em lotes (`batch_size`);
+- a existência no 7 é determinada diretamente por `items.itemid`; runtime (`item_rtdata`) e interface são coletados separadamente e mesclados por chave, evitando falsos `ITEM_MISSING` e associação cruzada de erros;
 - novos itens do 7 não são lidos nem analisados;
 - agregação de LLD é executada dentro do SQLite;
 - HTML limita o número de linhas exibidas, mas os CSVs têm os registros completos.
@@ -268,6 +273,7 @@ python -m zbx_migration_checker serve \
 - quantidade de regressões e hosts impactados;
 - categorias de erro mais frequentes;
 - top hosts com maior concentração de regressões;
+- tela **Falhas de interface**, contendo somente hosts habilitados em que nenhuma interface está sem erro, com interface, endpoint, disponibilidade e erro;
 - perda de filhos por discovery/LLD;
 - itens `Not discovered`, `Pending delete`, desabilitados e pendentes de desabilitação;
 - erros de coleta mais recorrentes;
@@ -322,3 +328,120 @@ python -m zbx_migration_checker serve \
 ```
 
 Em novas execuções do comando `compare`, o enriquecimento de templates já ocorre automaticamente.
+
+
+## v0.4.0 — correções de integridade e tabelas avançadas
+
+A v0.4 corrige três pontos importantes encontrados durante a validação de resultados reais:
+
+1. **Hosts desabilitados no Zabbix 7 são ignorados completamente.** Se o host está `status != 0` no ambiente atual, itens, regras LLD e filhos LLD desse host não geram regressão.
+2. **Erro do item e erro da interface são independentes.** `current_error` vem somente de `item_rtdata.error`. `interface_error` continua disponível como evidência separada.
+3. **`ITEM_MISSING` usa `items.itemid` como fonte de existência.** A coleta do item foi separada em três etapas: configuração/identidade, runtime e interface. Um item que existe em `items` não pode ser classificado como ausente apenas porque algum dado runtime/interface não foi encontrado.
+
+A tabela de itens também mostra lado a lado:
+
+- `itemid`;
+- nome/key do baseline 6;
+- tipo do item no 6;
+- tipo do item no 7;
+- key atual no 7;
+- erro do item;
+- erro da interface;
+- campos que mudaram.
+
+Isso ajuda a detectar imediatamente um caso em que o mesmo ID esteja associado a uma configuração diferente no ambiente novo.
+
+### Filtros e ordenação por coluna
+
+As tabelas de Itens, LLD, Regras LLD, Causas raiz, Templates e Hosts possuem agora:
+
+- filtro individual abaixo de cada coluna;
+- ordenação crescente/decrescente clicando no título da coluna;
+- filtros processados no backend/SQLite, e não somente na página atual;
+- paginação preservada para ambientes grandes.
+
+### Auditar um resultado gerado pela v0.3
+
+Antes de apagar seu resultado anterior, você pode verificar exatamente se ele sofreu os problemas corrigidos na v0.4:
+
+```bash
+python -m zbx_migration_checker audit-results \
+  --results reports/pos-upgrade/comparison_results.sqlite
+```
+
+Para conferir os `ITEM_MISSING` antigos diretamente contra a tabela `items` do Zabbix 7:
+
+```bash
+python -m zbx_migration_checker audit-results \
+  --results reports/pos-upgrade/comparison_results.sqlite \
+  --config config.yml \
+  --output reports/pos-upgrade/audit-v03.json
+```
+
+A auditoria informa, entre outros:
+
+- `ITEM_MISSING` que na verdade já estavam presentes no `current_items` armazenado;
+- `ITEM_MISSING` que existem atualmente em `items` no banco 7 (quando `--config` é usado);
+- anomalias pertencentes a hosts atualmente desabilitados;
+- casos em que o resultado antigo usou `interface_error` como se fosse o erro do item;
+- divergências entre `anomalies.current_error` e `current_items.rt_error`.
+
+### Atualizar o resultado sem refazer o snapshot do Zabbix 6
+
+O snapshot `data/zabbix6_baseline.sqlite` continua válido. Para usar as correções da v0.4, **não é necessário extrair novamente o Zabbix 6**. Reexecute apenas a comparação contra o 7:
+
+```bash
+python -m zbx_migration_checker compare \
+  --config config.yml \
+  --baseline data/zabbix6_baseline.sqlite \
+  --output-dir reports/pos-upgrade-v04 \
+  --force
+```
+
+Depois:
+
+```bash
+python -m zbx_migration_checker serve \
+  --results reports/pos-upgrade-v04/comparison_results.sqlite
+```
+
+
+## v0.4.1 — isolamento de falhas completas de interface
+
+A v0.4.1 separa falha de conectividade do host de regressão de item/template. Antes de analisar itens e discoveries, o comparador coleta **todas as interfaces do host no Zabbix 7**.
+
+Um host é isolado das regressões somente quando todas estas condições são verdadeiras:
+
+- o host existe e está habilitado (`hosts.status = 0`);
+- o host possui pelo menos uma interface;
+- **nenhuma interface está sem erro**. Para esta regra, uma interface é considerada em falha quando `interface_error` não está vazio ou `available = 2`.
+
+Se existir ao menos uma interface sem erro/indisponibilidade, o host continua na análise normal. Interfaces com `available = 0` e sem mensagem de erro não fazem o host ser isolado.
+
+Para os hosts isolados:
+
+- itens não entram em `item_regressions.csv`;
+- regras LLD não entram nas regressões;
+- perdas LLD desses hosts não entram no ranking;
+- o host não contamina o Top 20 de templates;
+- o host não entra em causas raiz/dependentes;
+- os dados aparecem na aba **Falhas de interface** e nos CSVs `host_interface_failures.csv` e `host_interface_failure_details.csv`.
+
+A aba mostra uma linha por interface, com host, `hostid`, `interfaceid`, tipo (Agent/SNMP/IPMI/JMX), interface principal, endpoint, disponibilidade, erro e proxy. A tabela possui filtros e ordenação por coluna.
+
+Não é necessário refazer o snapshot do Zabbix 6. Reexecute somente a comparação com esta versão:
+
+```bash
+python -m zbx_migration_checker compare \
+  --config config.yml \
+  --baseline data/zabbix6_baseline.sqlite \
+  --output-dir reports/pos-upgrade-v041 \
+  --force
+```
+
+Depois abra o frontend:
+
+```bash
+python -m zbx_migration_checker serve \
+  --results reports/pos-upgrade-v041/comparison_results.sqlite
+```

@@ -12,6 +12,7 @@ from .compare import compare_snapshot_to_current
 from .report import generate_html
 from .snapshot import create_snapshot
 from .templates import enrich_existing_results
+from .audit import audit_results
 from .web import add_serve_parser
 
 LOG = logging.getLogger(__name__)
@@ -103,6 +104,16 @@ def cmd_enrich_templates(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_audit_results(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config) if args.config else None
+    data = audit_results(args.results, cfg=cfg)
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    if args.output:
+        Path(args.output).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Auditoria: {args.output}")
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="zbx-db-migration-checker",
@@ -138,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--baseline", required=True, help="Snapshot SQLite do Zabbix 6 usado como baseline")
     p.add_argument("--results", required=True, help="comparison_results.sqlite ou diretório do relatório")
     p.set_defaults(func=cmd_enrich_templates)
+
+    p = sub.add_parser("audit-results", help="Audita falsos ITEM_MISSING, erros cruzados e hosts desabilitados em um resultado")
+    p.add_argument("--results", required=True, help="comparison_results.sqlite ou diretório")
+    p.add_argument("--config", help="Opcional: config.yml para validar ITEM_MISSING diretamente no banco atual")
+    p.add_argument("--output", help="Opcional: grava a auditoria em JSON")
+    p.set_defaults(func=cmd_audit_results)
 
     add_serve_parser(sub)
     return parser

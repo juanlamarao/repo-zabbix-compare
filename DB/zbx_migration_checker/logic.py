@@ -57,7 +57,9 @@ def classify_item(
     if current.get("host_status") is None:
         return "HOST_MISSING", "CRITICAL"
     if current.get("host_status") != HOST_STATUS_MONITORED:
-        return "HOST_DISABLED", "HIGH"
+        # Current disabled hosts are intentionally outside the migration-error
+        # scope. The user treats host disablement as a planned procedure.
+        return "IGNORE_HOST_DISABLED", "OK"
     if current.get("item_status") != ITEM_STATUS_ENABLED:
         return "ITEM_DISABLED", "HIGH"
     if current.get("rt_state") is None:
@@ -79,7 +81,7 @@ def classify_lld_rule(
     if current.get("host_status") is None:
         return "LLD_HOST_MISSING", "CRITICAL"
     if current.get("host_status") != HOST_STATUS_MONITORED:
-        return "LLD_HOST_DISABLED", "HIGH"
+        return "IGNORE_LLD_HOST_DISABLED", "OK"
     if current.get("item_status") != ITEM_STATUS_ENABLED:
         return "LLD_DISABLED", "HIGH"
     if current.get("rt_state") is None:
@@ -146,6 +148,7 @@ def loss_severity(
 
 def structural_diff(baseline: Mapping[str, Any], current: Mapping[str, Any]) -> list[str]:
     fields = (
+        "hostid",
         "item_type",
         "key_",
         "value_type",
@@ -154,6 +157,7 @@ def structural_diff(baseline: Mapping[str, Any], current: Mapping[str, Any]) -> 
         "delay",
         "timeout",
         "snmp_oid",
+        "templateid",
     )
     changed: list[str] = []
     for field in fields:

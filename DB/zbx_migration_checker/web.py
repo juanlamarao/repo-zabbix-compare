@@ -6,53 +6,119 @@ import mimetypes
 import sqlite3
 import urllib.parse
 from collections import Counter
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "WARNING": 2, "OK": 1}
+
+SEVERITY_EXPR = "CASE severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3 WHEN 'WARNING' THEN 2 ELSE 1 END"
 
 ITEM_SORTS = {
-    "severity": "CASE severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3 WHEN 'WARNING' THEN 2 ELSE 1 END",
-    "host": "host",
+    "severity": SEVERITY_EXPR,
+    "base_template_name": "base_template_name",
+    "host_name": "COALESCE(NULLIF(host_name,''),host)",
     "itemid": "itemid",
-    "category": "category",
     "item_name": "item_name",
+    "key_": "key_",
+    "category": "category",
+    "current_error": "current_error",
+    "baseline_item_type": "baseline_item_type",
+    "current_item_type": "current_item_type",
+    "current_key_": "current_key_",
+    "master_itemid": "master_itemid",
     "dependent_affected_count": "dependent_affected_count",
+    "changed_fields": "changed_fields",
 }
+ITEM_FILTERS = {k: v for k, v in ITEM_SORTS.items() if k != "severity"} | {"severity": "severity"}
+
 LLD_SORTS = {
-    "severity": "CASE severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3 WHEN 'WARNING' THEN 2 ELSE 1 END",
-    "host": "host",
+    "severity": SEVERITY_EXPR,
+    "base_template_name": "base_template_name",
+    "host_name": "COALESCE(NULLIF(host_name,''),host)",
     "ruleid": "ruleid",
+    "rule_name": "rule_name",
+    "baseline_count": "baseline_count",
+    "current_present_count": "current_present_count",
+    "lost_count": "lost_count",
     "loss_pct": "loss_pct",
     "operational_loss_pct": "operational_loss_pct",
-    "lost_count": "lost_count",
-    "baseline_count": "baseline_count",
-}
-LLD_RULE_SORTS = {
-    "severity": "CASE severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3 WHEN 'WARNING' THEN 2 ELSE 1 END",
-    "host": "host",
-    "itemid": "itemid",
+    "not_discovered_count": "not_discovered_count",
+    "pending_delete_count": "pending_delete_count",
+    "disabled_count": "disabled_count",
     "category": "category",
+}
+LLD_FILTERS = {k: v for k, v in LLD_SORTS.items() if k != "severity"} | {"severity": "severity"}
+
+LLD_RULE_SORTS = {
+    "severity": SEVERITY_EXPR,
+    "base_template_name": "base_template_name",
+    "host_name": "COALESCE(NULLIF(host_name,''),host)",
+    "itemid": "itemid",
     "rule_name": "rule_name",
+    "key_": "key_",
+    "category": "category",
+    "current_error": "current_error",
+    "changed_fields": "changed_fields",
 }
+LLD_RULE_FILTERS = {k: v for k, v in LLD_RULE_SORTS.items() if k != "severity"} | {"severity": "severity"}
+
+ROOT_SORTS = {
+    "severity": SEVERITY_EXPR,
+    "base_template_name": "base_template_name",
+    "host_name": "COALESCE(NULLIF(host_name,''),host)",
+    "itemid": "itemid",
+    "item_name": "item_name",
+    "category": "category",
+    "dependent_affected_count": "dependent_affected_count",
+    "current_error": "current_error",
+    "changed_fields": "changed_fields",
+}
+ROOT_FILTERS = {k: v for k, v in ROOT_SORTS.items() if k != "severity"} | {"severity": "severity"}
+
 HOST_SORTS = {
+    "host_name": "host_name",
     "anomaly_count": "anomaly_count",
-    "host": "host",
-    "critical": "critical_count",
-    "high": "high_count",
+    "critical_count": "critical_count",
+    "high_count": "high_count",
+    "warning_count": "warning_count",
+    "category_count": "category_count",
+    "dependent_affected_count": "dependent_affected_count",
 }
+HOST_FILTERS = {k: k for k in HOST_SORTS}
+
+INTERFACE_HOST_SORTS = {
+    "host_name": "host_name",
+    "host": "host",
+    "hostid": "hostid",
+    "interfaceid": "interfaceid",
+    "interface_type": "interface_type",
+    "interface_main": "interface_main",
+    "endpoint": "endpoint",
+    "interface_available": "interface_available",
+    "interface_error": "interface_error",
+    "proxy_ref": "proxy_ref",
+    "interface_count": "interface_count",
+}
+INTERFACE_HOST_FILTERS = {k: k for k in INTERFACE_HOST_SORTS}
+
 TEMPLATE_SORTS = {
     "rank": "rank",
-    "priority_score": "priority_score",
-    "impact_count": "impact_count",
     "template_name": "template_name",
+    "impact_count": "impact_count",
     "hosts_affected": "hosts_affected",
     "item_regressions": "item_regressions",
     "critical_count": "critical_count",
+    "high_count": "high_count",
+    "lld_rule_regressions": "lld_rule_regressions",
+    "lld_groups_with_loss": "lld_groups_with_loss",
+    "lld_total_loss": "lld_total_loss",
     "lld_lost_children": "lld_lost_children",
+    "lld_pending_delete": "lld_pending_delete",
+    "dependent_affected": "dependent_affected",
+    "priority_score": "priority_score",
+    "template_hostid": "template_hostid",
 }
+TEMPLATE_FILTERS = {k: k for k in TEMPLATE_SORTS}
 
 
 def _conn(db_path: Path) -> sqlite3.Connection:
@@ -102,20 +168,15 @@ def api_overview(db_path: Path) -> dict[str, Any]:
     with _conn(db_path) as conn:
         meta = _metadata(conn)
         summary = meta.get("summary", {}) if isinstance(meta.get("summary"), dict) else {}
-        severity = {r["severity"]: r["n"] for r in conn.execute("SELECT severity,COUNT(*) n FROM anomalies GROUP BY severity")}
-        lld_severity = {r["severity"]: r["n"] for r in conn.execute("SELECT severity,COUNT(*) n FROM lld_summary WHERE category<>'OK' GROUP BY severity")}
-        roots = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE dependent_affected_count>0")
-        dependents = _scalar(conn, "SELECT COALESCE(SUM(dependent_affected_count),0) FROM anomalies WHERE dependent_affected_count>0")
-        pending_delete = _scalar(conn, "SELECT COALESCE(SUM(pending_delete_count),0) FROM lld_summary")
         return {
             "status": _status(conn),
             "summary": summary,
-            "severity": severity,
-            "lld_severity": lld_severity,
-            "root_causes": roots,
-            "dependent_affected": dependents,
-            "pending_delete": pending_delete,
+            "pending_delete": _scalar(conn, "SELECT COALESCE(SUM(pending_delete_count),0) FROM lld_summary"),
             "templates_impacted": _scalar(conn, "SELECT COUNT(*) FROM template_summary"),
+            "ignored_disabled_hosts": meta.get("ignored_current_disabled_hosts", 0),
+            "interface_failure_hosts": _scalar(conn, "SELECT COUNT(*) FROM host_interface_failures"),
+            "fetch_recovered": meta.get("current_fetch_recovered_by_presence", 0),
+            "fetch_unresolved": meta.get("current_fetch_unresolved_existing_items", 0),
             "created_at_utc": meta.get("created_at_utc"),
             "current_dbversion": meta.get("current_dbversion"),
             "baseline_metadata": meta.get("baseline_metadata"),
@@ -148,7 +209,17 @@ def api_charts(db_path: Path) -> dict[str, Any]:
         return {"categories": categories, "hosts": hosts, "lld": lld, "lld_reasons": reasons, "errors": errors, "templates": templates}
 
 
-def _where(params: dict[str, list[str]], table: str) -> tuple[str, list[Any]]:
+def _add_column_filters(params: dict[str, list[str]], allowed: dict[str, str], clauses: list[str], args: list[Any], alias: str = "") -> None:
+    for key, expr in allowed.items():
+        value = (params.get(f"f_{key}") or [""])[0].strip()
+        if not value:
+            continue
+        field = f"{alias}.{expr}" if alias and expr.replace("_", "").isalnum() else expr
+        clauses.append(f"LOWER(CAST({field} AS TEXT)) LIKE LOWER(?)")
+        args.append(f"%{value}%")
+
+
+def _where(params: dict[str, list[str]], table: str, column_filters: dict[str, str]) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     args: list[Any] = []
     sev = (params.get("severity") or [""])[0].strip().upper()
@@ -171,110 +242,145 @@ def _where(params: dict[str, list[str]], table: str) -> tuple[str, list[Any]]:
     if q:
         like = f"%{q}%"
         if table == "anomalies":
-            clauses.append("(host LIKE ? OR host_name LIKE ? OR item_name LIKE ? OR key_ LIKE ? OR CAST(itemid AS TEXT) LIKE ? OR current_error LIKE ?)")
-            args.extend([like] * 6)
+            clauses.append("(host LIKE ? OR host_name LIKE ? OR item_name LIKE ? OR key_ LIKE ? OR current_key_ LIKE ? OR CAST(itemid AS TEXT) LIKE ? OR current_error LIKE ?)")
+            args.extend([like] * 7)
         elif table == "lld_summary":
             clauses.append("(host LIKE ? OR host_name LIKE ? OR rule_name LIKE ? OR rule_key LIKE ? OR CAST(ruleid AS TEXT) LIKE ?)")
             args.extend([like] * 5)
         elif table == "lld_rule_anomalies":
             clauses.append("(host LIKE ? OR host_name LIKE ? OR rule_name LIKE ? OR key_ LIKE ? OR CAST(itemid AS TEXT) LIKE ? OR current_error LIKE ?)")
             args.extend([like] * 6)
+    _add_column_filters(params, column_filters, clauses, args)
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
 
 
-def _paged(conn: sqlite3.Connection, table: str, columns: str, params: dict[str, list[str]], sorts: dict[str, str], default_sort: str) -> dict[str, Any]:
+def _paged(conn: sqlite3.Connection, table: str, columns: str, params: dict[str, list[str]], sorts: dict[str, str], filters: dict[str, str], default_sort: str, extra_clause: str | None = None) -> dict[str, Any]:
     page = max(1, int((params.get("page") or ["1"])[0] or 1))
     page_size = min(250, max(10, int((params.get("page_size") or ["50"])[0] or 50)))
     sort = (params.get("sort") or [default_sort])[0]
     direction = "ASC" if (params.get("dir") or ["desc"])[0].lower() == "asc" else "DESC"
     order = sorts.get(sort, sorts[default_sort])
-    where, args = _where(params, table)
+    where, args = _where(params, table, filters)
+    if extra_clause:
+        where = (where + " AND " if where else " WHERE ") + extra_clause
     total = _scalar(conn, f"SELECT COUNT(*) FROM {table}{where}", tuple(args))
     sql = f"SELECT {columns} FROM {table}{where} ORDER BY {order} {direction}, rowid DESC LIMIT ? OFFSET ?"
     rows = _rows(conn.execute(sql, tuple(args + [page_size, (page - 1) * page_size])))
-    return {"rows": rows, "total": total, "page": page, "page_size": page_size, "pages": max(1, (int(total) + page_size - 1) // page_size)}
+    return {"rows": rows, "total": total, "page": page, "page_size": page_size, "pages": max(1, (int(total) + page_size - 1) // page_size), "sort": sort, "dir": direction.lower()}
 
 
 def api_items(db_path: Path, params: dict[str, list[str]]) -> dict[str, Any]:
+    cols = "itemid,hostid,host,host_name,item_name,key_,category,severity,current_error,current_interface_error,master_itemid,master_anomaly_itemid,master_anomaly_category,dependent_affected_count,changed_fields,current_proxy_ref,baseline_proxy_ref,direct_template_hostid,direct_template_name,base_template_hostid,base_template_name,template_depth,baseline_item_type,current_item_type,current_item_name,current_key_,current_hostid,current_host,current_host_name"
     with _conn(db_path) as conn:
-        return _paged(conn, "anomalies", "itemid,hostid,host,host_name,item_name,key_,category,severity,current_error,current_interface_error,master_itemid,master_anomaly_itemid,master_anomaly_category,dependent_affected_count,changed_fields,current_proxy_ref,baseline_proxy_ref,direct_template_hostid,direct_template_name,base_template_hostid,base_template_name,template_depth", params, ITEM_SORTS, "severity")
+        return _paged(conn, "anomalies", cols, params, ITEM_SORTS, ITEM_FILTERS, "severity")
 
 
 def api_lld(db_path: Path, params: dict[str, list[str]]) -> dict[str, Any]:
+    cols = "group_id,ruleid,prototypeid,hostid,host,host_name,rule_name,rule_key,baseline_count,current_present_count,lost_count,loss_pct,baseline_operational_count,current_operational_count,operational_lost_count,operational_loss_pct,missing_count,metadata_missing_count,not_discovered_count,pending_delete_count,disabled_count,pending_disable_count,category,severity,direct_template_hostid,direct_template_name,base_template_hostid,base_template_name,template_depth"
     with _conn(db_path) as conn:
-        return _paged(conn, "lld_summary", "group_id,ruleid,prototypeid,hostid,host,host_name,rule_name,rule_key,baseline_count,current_present_count,lost_count,loss_pct,baseline_operational_count,current_operational_count,operational_lost_count,operational_loss_pct,missing_count,metadata_missing_count,not_discovered_count,pending_delete_count,disabled_count,pending_disable_count,category,severity,direct_template_hostid,direct_template_name,base_template_hostid,base_template_name,template_depth", params, LLD_SORTS, "severity")
+        return _paged(conn, "lld_summary", cols, params, LLD_SORTS, LLD_FILTERS, "severity")
 
 
 def api_lld_rules(db_path: Path, params: dict[str, list[str]]) -> dict[str, Any]:
+    cols = "itemid,hostid,host,host_name,rule_name,key_,category,severity,current_error,changed_fields,direct_template_hostid,direct_template_name,base_template_hostid,base_template_name,template_depth"
     with _conn(db_path) as conn:
-        return _paged(conn, "lld_rule_anomalies", "itemid,hostid,host,host_name,rule_name,key_,category,severity,current_error,changed_fields,direct_template_hostid,direct_template_name,base_template_hostid,base_template_name,template_depth", params, LLD_RULE_SORTS, "severity")
+        return _paged(conn, "lld_rule_anomalies", cols, params, LLD_RULE_SORTS, LLD_RULE_FILTERS, "severity")
+
+
+def _filter_subquery(params: dict[str, list[str]], filters: dict[str, str], q_fields: list[str]) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    args: list[Any] = []
+    q = (params.get("q") or [""])[0].strip()
+    if q:
+        like = f"%{q}%"
+        clauses.append("(" + " OR ".join(f"CAST({f} AS TEXT) LIKE ?" for f in q_fields) + ")")
+        args.extend([like] * len(q_fields))
+    _add_column_filters(params, filters, clauses, args)
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
 
 
 def api_hosts(db_path: Path, params: dict[str, list[str]]) -> dict[str, Any]:
     page = max(1, int((params.get("page") or ["1"])[0] or 1))
     page_size = min(250, max(10, int((params.get("page_size") or ["50"])[0] or 50)))
-    q = (params.get("q") or [""])[0].strip()
     direction = "ASC" if (params.get("dir") or ["desc"])[0].lower() == "asc" else "DESC"
     sort = (params.get("sort") or ["anomaly_count"])[0]
     order = HOST_SORTS.get(sort, HOST_SORTS["anomaly_count"])
+    base = """
+        SELECT hostid,host,COALESCE(NULLIF(host_name,''),host) host_name,COUNT(*) anomaly_count,
+               SUM(CASE WHEN severity='CRITICAL' THEN 1 ELSE 0 END) critical_count,
+               SUM(CASE WHEN severity='HIGH' THEN 1 ELSE 0 END) high_count,
+               SUM(CASE WHEN severity='WARNING' THEN 1 ELSE 0 END) warning_count,
+               COUNT(DISTINCT category) category_count,
+               COALESCE(SUM(dependent_affected_count),0) dependent_affected_count
+        FROM anomalies GROUP BY hostid,host,host_name
+    """
+    where, args = _filter_subquery(params, HOST_FILTERS, ["host", "host_name", "hostid"])
     with _conn(db_path) as conn:
-        where = ""
-        args: list[Any] = []
-        if q:
-            where = "WHERE host LIKE ? OR host_name LIKE ?"
-            args = [f"%{q}%", f"%{q}%"]
-        base = f"""
-            SELECT hostid,host,host_name,COUNT(*) anomaly_count,
-                   SUM(CASE WHEN severity='CRITICAL' THEN 1 ELSE 0 END) critical_count,
-                   SUM(CASE WHEN severity='HIGH' THEN 1 ELSE 0 END) high_count,
-                   SUM(CASE WHEN severity='WARNING' THEN 1 ELSE 0 END) warning_count,
-                   COUNT(DISTINCT category) category_count,
-                   COALESCE(SUM(dependent_affected_count),0) dependent_affected_count
-            FROM anomalies {where}
-            GROUP BY hostid,host,host_name
-        """
-        total = _scalar(conn, f"SELECT COUNT(*) FROM ({base}) x", tuple(args))
-        rows = _rows(conn.execute(f"{base} ORDER BY {order} {direction}, host ASC LIMIT ? OFFSET ?", tuple(args + [page_size, (page - 1) * page_size])))
-        return {"rows": rows, "total": total, "page": page, "page_size": page_size, "pages": max(1, (int(total) + page_size - 1) // page_size)}
+        total = _scalar(conn, f"SELECT COUNT(*) FROM ({base}) x{where}", tuple(args))
+        rows = _rows(conn.execute(f"SELECT * FROM ({base}) x{where} ORDER BY {order} {direction}, host_name ASC LIMIT ? OFFSET ?", tuple(args + [page_size, (page - 1) * page_size])))
+        return {"rows": rows, "total": total, "page": page, "page_size": page_size, "pages": max(1, (int(total) + page_size - 1) // page_size), "sort": sort, "dir": direction.lower()}
+
+
+def api_interface_hosts(db_path: Path, params: dict[str, list[str]]) -> dict[str, Any]:
+    page = max(1, int((params.get("page") or ["1"])[0] or 1))
+    page_size = min(250, max(10, int((params.get("page_size") or ["50"])[0] or 50)))
+    direction = "ASC" if (params.get("dir") or ["asc"])[0].lower() == "asc" else "DESC"
+    sort = (params.get("sort") or ["host_name"])[0]
+    order = INTERFACE_HOST_SORTS.get(sort, INTERFACE_HOST_SORTS["host_name"])
+    base = """
+        SELECT
+            hf.hostid, hf.host, COALESCE(NULLIF(hf.host_name,''),hf.host) host_name, hf.proxy_ref,
+            hf.interface_count, hf.failing_interface_count,
+            i.interfaceid, i.interface_type, i.interface_main, i.interface_useip,
+            i.interface_ip, i.interface_dns, i.interface_port, i.interface_available, i.interface_error,
+            CASE
+                WHEN COALESCE(i.interface_useip,1)=1 THEN COALESCE(NULLIF(i.interface_ip,''),'(sem IP)')
+                ELSE COALESCE(NULLIF(i.interface_dns,''),'(sem DNS)')
+            END || CASE WHEN COALESCE(i.interface_port,'')<>'' THEN ':' || i.interface_port ELSE '' END AS endpoint
+        FROM host_interface_failures hf
+        JOIN current_host_interfaces i ON i.hostid=hf.hostid
+        WHERE i.is_failure=1
+    """
+    where, args = _filter_subquery(
+        params, INTERFACE_HOST_FILTERS,
+        ["host", "host_name", "hostid", "interfaceid", "endpoint", "interface_error", "proxy_ref"]
+    )
+    with _conn(db_path) as conn:
+        total = _scalar(conn, f"SELECT COUNT(*) FROM ({base}) x{where}", tuple(args))
+        host_total = _scalar(conn, "SELECT COUNT(*) FROM host_interface_failures")
+        rows = _rows(conn.execute(
+            f"SELECT * FROM ({base}) x{where} ORDER BY {order} {direction}, host_name ASC, interfaceid ASC LIMIT ? OFFSET ?",
+            tuple(args + [page_size, (page - 1) * page_size])
+        ))
+        return {
+            "rows": rows, "total": total, "host_total": host_total, "page": page, "page_size": page_size,
+            "pages": max(1, (int(total) + page_size - 1) // page_size), "sort": sort, "dir": direction.lower()
+        }
 
 
 def api_templates(db_path: Path, params: dict[str, list[str]]) -> dict[str, Any]:
     page = max(1, int((params.get("page") or ["1"])[0] or 1))
     page_size = min(250, max(10, int((params.get("page_size") or ["50"])[0] or 50)))
-    q = (params.get("q") or [""])[0].strip()
     direction = "ASC" if (params.get("dir") or ["asc"])[0].lower() == "asc" else "DESC"
     sort = (params.get("sort") or ["rank"])[0]
     order = TEMPLATE_SORTS.get(sort, TEMPLATE_SORTS["rank"])
+    where, args = _filter_subquery(params, TEMPLATE_FILTERS, ["template_name", "template_host", "template_hostid"])
     with _conn(db_path) as conn:
-        where = ""
-        args: list[Any] = []
-        if q:
-            where = "WHERE template_name LIKE ? OR template_host LIKE ? OR CAST(template_hostid AS TEXT) LIKE ?"
-            like = f"%{q}%"
-            args = [like, like, like]
-        total = _scalar(conn, f"SELECT COUNT(*) FROM template_summary {where}", tuple(args))
+        total = _scalar(conn, f"SELECT COUNT(*) FROM template_summary{where}", tuple(args))
         rows = _rows(conn.execute(f"""
             SELECT rank,template_hostid,template_host,template_name,priority_score,impact_count,hosts_affected,
                    item_regressions,lld_rule_regressions,lld_groups_with_loss,lld_total_loss,lld_lost_children,
                    lld_pending_delete,dependent_affected,critical_count,high_count,warning_count
-            FROM template_summary {where}
+            FROM template_summary{where}
             ORDER BY {order} {direction}, rank ASC LIMIT ? OFFSET ?
         """, tuple(args + [page_size, (page - 1) * page_size])))
-        return {"rows": rows, "total": total, "page": page, "page_size": page_size, "pages": max(1, (int(total) + page_size - 1) // page_size)}
+        return {"rows": rows, "total": total, "page": page, "page_size": page_size, "pages": max(1, (int(total) + page_size - 1) // page_size), "sort": sort, "dir": direction.lower()}
 
 
-def api_roots(db_path: Path) -> dict[str, Any]:
+def api_roots(db_path: Path, params: dict[str, list[str]]) -> dict[str, Any]:
+    cols = "itemid,hostid,host,host_name,item_name,key_,category,severity,current_error,dependent_affected_count,changed_fields,base_template_hostid,base_template_name,baseline_item_type,current_item_type,current_key_"
     with _conn(db_path) as conn:
-        rows = _rows(conn.execute("""
-            SELECT itemid,hostid,host,host_name,item_name,key_,category,severity,current_error,
-                   dependent_affected_count,changed_fields,base_template_hostid,base_template_name
-            FROM anomalies
-            WHERE dependent_affected_count>0
-            ORDER BY dependent_affected_count DESC,
-                     CASE severity WHEN 'CRITICAL' THEN 4 WHEN 'HIGH' THEN 3 WHEN 'WARNING' THEN 2 ELSE 1 END DESC
-            LIMIT 200
-        """))
-        return {"rows": rows, "total": _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE dependent_affected_count>0")}
+        return _paged(conn, "anomalies", cols, params, ROOT_SORTS, ROOT_FILTERS, "dependent_affected_count", "dependent_affected_count>0")
 
 
 def _top_errors(conn: sqlite3.Connection, category: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
@@ -283,11 +389,7 @@ def _top_errors(conn: sqlite3.Connection, category: str | None = None, limit: in
     if category:
         where += " AND category=?"
         args.append(category)
-    return _rows(conn.execute(f"""
-        SELECT current_error error,COUNT(*) count
-        FROM anomalies {where}
-        GROUP BY current_error ORDER BY count DESC LIMIT ?
-    """, tuple(args + [limit])))
+    return _rows(conn.execute(f"SELECT current_error error,COUNT(*) count FROM anomalies {where} GROUP BY current_error ORDER BY count DESC LIMIT ?", tuple(args + [limit])))
 
 
 def api_recommendations(db_path: Path) -> dict[str, Any]:
@@ -298,72 +400,59 @@ def api_recommendations(db_path: Path) -> dict[str, Any]:
                 recs.append({"priority": priority, "code": code, "title": title, "count": int(count), "why": why, "action": action, "evidence": evidence, "target": target})
 
         n = _scalar(conn, "SELECT COUNT(*) FROM lld_summary WHERE category='LLD_TOTAL_LOSS'")
-        examples = _rows(conn.execute("SELECT ruleid,host,rule_name,baseline_count,lost_count,pending_delete_count FROM lld_summary WHERE category='LLD_TOTAL_LOSS' ORDER BY baseline_count DESC LIMIT 5"))
         add("P0", "LLD_TOTAL_LOSS", "Restaurar discoveries com perda total", n,
             "Uma regra/prototype que possuía filhos válidos no Zabbix 6 ficou sem nenhum filho efetivamente presente no 7.",
-            "Priorize essas LLDs. Valide o estado da própria regra, macros, filtros, credenciais/interface e preprocessing. Se houver filhos com deleção agendada, corrija a causa do discovery antes do prazo de remoção.", examples, "lld")
+            "Valide primeiro a própria regra LLD, macros, filtros, credenciais/interface e preprocessing.",
+            _rows(conn.execute("SELECT ruleid,host,rule_name,baseline_count,lost_count,pending_delete_count FROM lld_summary WHERE category='LLD_TOTAL_LOSS' ORDER BY baseline_count DESC LIMIT 5")), "lld")
 
         n = _scalar(conn, "SELECT COUNT(*) FROM lld_rule_anomalies WHERE category IN ('LLD_NOT_SUPPORTED','LLD_MISSING','LLD_HOST_MISSING')")
-        examples = _rows(conn.execute("SELECT itemid,host,rule_name,category,current_error FROM lld_rule_anomalies WHERE category IN ('LLD_NOT_SUPPORTED','LLD_MISSING','LLD_HOST_MISSING') ORDER BY CASE severity WHEN 'CRITICAL' THEN 4 ELSE 1 END DESC LIMIT 5"))
         add("P0", "LLD_RULE_BROKEN", "Corrigir regras LLD quebradas", n,
             "A própria regra de discovery estava saudável no baseline e agora está ausente ou unsupported.",
-            "Corrija primeiro a regra LLD e só depois os filhos. Use a mensagem de erro como evidência e confira diferenças de configuração registradas em changed_fields.", examples, "lld-rules")
+            "Corrija a regra LLD antes de atuar nos filhos.",
+            _rows(conn.execute("SELECT itemid,host,rule_name,category,current_error FROM lld_rule_anomalies WHERE category IN ('LLD_NOT_SUPPORTED','LLD_MISSING','LLD_HOST_MISSING') LIMIT 5")), "lld-rules")
 
         n = _scalar(conn, "SELECT COALESCE(SUM(pending_delete_count),0) FROM lld_summary")
-        examples = _rows(conn.execute("SELECT ruleid,host,rule_name,pending_delete_count,lost_count FROM lld_summary WHERE pending_delete_count>0 ORDER BY pending_delete_count DESC LIMIT 5"))
         add("P0", "PENDING_DELETE", "Revisar itens LLD marcados para deleção", n,
-            "Esses filhos ainda podem existir fisicamente no banco, mas já estão marcados para remoção pelo mecanismo LLD.",
-            "Verifique se a perda é esperada. Quando não for, restaure o discovery e revise a política/lifetime de lost resources antes que os objetos sejam apagados.", examples, "lld")
+            "Esses filhos ainda podem existir fisicamente no banco, mas já estão marcados para remoção.",
+            "Confirme se a perda é esperada e corrija a causa do discovery antes do prazo de remoção.", None, "lld")
 
         roots = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE dependent_affected_count>0")
         affected = _scalar(conn, "SELECT COALESCE(SUM(dependent_affected_count),0) FROM anomalies WHERE dependent_affected_count>0")
-        examples = _rows(conn.execute("SELECT itemid,host,item_name,category,current_error,dependent_affected_count FROM anomalies WHERE dependent_affected_count>0 ORDER BY dependent_affected_count DESC LIMIT 8"))
         if roots:
-            recs.append({"priority": "P0" if affected >= 100 else "P1", "code": "MASTER_ROOT_CAUSE", "title": "Corrigir master items antes dos dependentes", "count": int(roots), "why": f"{roots} master item(ns) em regressão concentram {affected} dependente(s) também afetado(s).", "action": "Trate o master item como causa raiz. Após normalizá-lo, reavalie os dependentes antes de fazer alterações individuais.", "evidence": examples, "target": "roots"})
+            recs.append({"priority": "P0" if affected >= 100 else "P1", "code": "MASTER_ROOT_CAUSE", "title": "Corrigir master items antes dos dependentes", "count": int(roots), "why": f"{roots} master item(ns) concentram {affected} dependente(s) afetado(s).", "action": "Trate o master como causa raiz e reavalie os dependentes após normalizá-lo.", "evidence": _rows(conn.execute("SELECT itemid,host,item_name,category,current_error,dependent_affected_count FROM anomalies WHERE dependent_affected_count>0 ORDER BY dependent_affected_count DESC LIMIT 8")), "target": "roots"})
 
         n = _scalar(conn, "SELECT COUNT(*) FROM template_summary")
-        examples = _rows(conn.execute("""
-            SELECT rank,template_hostid,template_name,impact_count,hosts_affected,item_regressions,
-                   lld_groups_with_loss,lld_lost_children,critical_count,high_count
-            FROM template_summary ORDER BY rank LIMIT 8
-        """))
         add("P1", "TEMPLATE_FOCUS", "Atacar regressões por template base", n,
-            "As regressões foram correlacionadas com a origem de herança do item. Corrigir um template base pode normalizar muitos hosts e objetos de uma só vez.",
-            "Comece pelos templates do Top 20, priorizando os que concentram CRITICAL, perda total de LLD e maior impacto. Corrija no template base, valide em poucos hosts e então propague/reteste.", examples, "templates")
+            "Corrigir um template base pode normalizar muitos hosts e objetos de uma vez.",
+            "Comece pelo Top 20 e valide em poucos hosts antes de propagar/retestar.",
+            _rows(conn.execute("SELECT rank,template_hostid,template_name,impact_count,hosts_affected,item_regressions,lld_lost_children,critical_count,high_count FROM template_summary ORDER BY rank LIMIT 8")), "templates")
 
         n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE category='ITEM_NOT_SUPPORTED'")
         add("P1", "ITEM_NOT_SUPPORTED", "Resolver itens que viraram Not supported", n,
             "Os itens estavam normais no Zabbix 6 e estão unsupported no 7.",
-            "Agrupe pela mensagem de erro para corrigir por causa comum. Confira timeout, interface, credenciais, OID/key, preprocessing e master item; dê prioridade aos erros mais repetidos.", _top_errors(conn, "ITEM_NOT_SUPPORTED", 8), "items")
+            "Agrupe pela mensagem de erro do próprio item e corrija por causa comum.", _top_errors(conn, "ITEM_NOT_SUPPORTED", 8), "items")
 
-        n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE COALESCE(current_interface_error,'')<>'' OR current_interface_available=2")
-        examples = _rows(conn.execute("SELECT host,host_name,COUNT(*) count,MAX(current_interface_error) interface_error FROM anomalies WHERE COALESCE(current_interface_error,'')<>'' OR current_interface_available=2 GROUP BY hostid,host,host_name ORDER BY count DESC LIMIT 8"))
-        add("P1", "INTERFACE_FAILURE", "Corrigir falhas de interface antes dos itens", n,
-            "Há regressões associadas a interfaces indisponíveis ou com mensagem de erro no ambiente novo.",
-            "Valide conectividade, endereço/DNS, porta, credenciais SNMP/JMX/IPMI/agent e associação da interface. Corrija a interface/host primeiro e reavalie os itens afetados.", examples, "hosts")
-
-        n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE category IN ('HOST_MISSING','HOST_DISABLED')")
-        examples = _rows(conn.execute("SELECT host,host_name,category,COUNT(*) count FROM anomalies WHERE category IN ('HOST_MISSING','HOST_DISABLED') GROUP BY hostid,host,host_name,category ORDER BY count DESC LIMIT 8"))
-        add("P1", "HOST_STATE", "Revisar hosts ausentes ou desabilitados", n,
-            "Muitos erros de item podem ser consequência do estado do host em vez de problemas individuais de coleta.",
-            "Compare o status do host entre os ambientes e confirme se a ausência/desabilitação foi planejada. Corrija no nível do host antes de atuar item a item.", examples, "hosts")
+        n = _scalar(conn, "SELECT COUNT(*) FROM host_interface_failures")
+        add("P1", "INTERFACE_FAILURE", "Corrigir hosts com todas as interfaces em erro", n,
+            "Esses hosts foram retirados das regressões de itens, LLD, templates e causas raiz porque nenhuma interface atual está sem erro.",
+            "Trate primeiro conectividade, credenciais, proxy e disponibilidade da interface. Depois execute uma nova comparação para avaliar os objetos do host.",
+            _rows(conn.execute("SELECT hostid,host,host_name,interface_count,errors_summary FROM host_interface_failures ORDER BY host_name LIMIT 8")),
+            "interface-hosts")
 
         n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE category='ITEM_MISSING'")
-        examples = _rows(conn.execute("SELECT host,itemid,item_name,key_,changed_fields FROM anomalies WHERE category='ITEM_MISSING' ORDER BY host LIMIT 8"))
-        add("P1", "ITEM_MISSING", "Investigar itens do baseline ausentes", n,
-            "O item existia e estava saudável no Zabbix 6, mas o mesmo itemid não foi encontrado no 7.",
-            "Confirme se houve exclusão intencional durante o upgrade/importação. Se não houve, restaure a configuração correspondente e investigue a origem da perda.", examples, "items")
+        add("P1", "ITEM_MISSING", "Investigar somente IDs realmente ausentes em items", n,
+            "Na v0.4, ITEM_MISSING só pode ocorrer quando o itemid não existe na tabela items do Zabbix 7.",
+            "Confirme exclusão planejada ou falha de migração/importação.", None, "items")
 
         n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE category='ITEM_DISABLED'")
-        add("P1", "ITEM_DISABLED", "Revisar itens desabilitados após a migração", n,
-            "Itens habilitados e saudáveis no baseline aparecem desabilitados no novo ambiente.",
-            "Confirme se a mudança foi intencional. Quando não for, reabilite pelo mecanismo correto (item, prototype ou LLD) e valide se não há regra de override desabilitando o objeto.", None, "items")
+        add("P1", "ITEM_DISABLED", "Revisar itens desabilitados", n,
+            "Itens habilitados no baseline aparecem desabilitados no ambiente novo, em hosts que continuam monitorados.",
+            "Confirme overrides/prototypes e se a mudança foi intencional.", None, "items")
 
-        n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE baseline_proxy_ref IS NOT current_proxy_ref AND COALESCE(baseline_proxy_ref,-1)<>COALESCE(current_proxy_ref,-1)")
-        examples = _rows(conn.execute("SELECT host,host_name,baseline_proxy_ref,current_proxy_ref,COUNT(*) count FROM anomalies WHERE COALESCE(baseline_proxy_ref,-1)<>COALESCE(current_proxy_ref,-1) GROUP BY hostid,host,host_name,baseline_proxy_ref,current_proxy_ref ORDER BY count DESC LIMIT 8"))
-        add("P2", "PROXY_CHANGED", "Validar mudanças de proxy nos hosts afetados", n,
-            "Existem itens com regressão em que a referência de proxy difere do baseline.",
-            "Se a mudança de proxy fazia parte do plano, confirme que o novo proxy está ativo, compatível e recebendo a configuração. Se não era esperada, revise a associação do host/proxy.", examples, "hosts")
+        n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE COALESCE(baseline_proxy_ref,-1)<>COALESCE(current_proxy_ref,-1)")
+        add("P2", "PROXY_CHANGED", "Validar mudanças de proxy", n,
+            "Há regressões em hosts cuja referência de proxy difere do baseline.",
+            "Confirme se o novo proxy está ativo, compatível e recebendo configuração.", None, "hosts")
 
         n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE changed_fields<>''")
         fields: Counter[str] = Counter()
@@ -371,19 +460,9 @@ def api_recommendations(db_path: Path) -> dict[str, Any]:
             for field in (row[0] or "").split(","):
                 if field:
                     fields[field] += 1
-        add("P2", "STRUCTURAL_DIFF", "Revisar diferenças estruturais nos itens que regrediram", n,
+        add("P2", "STRUCTURAL_DIFF", "Revisar diferenças estruturais", n,
             "Há itens com regressão cujo cadastro mudou entre 6 e 7.",
-            "Use as diferenças como pista de causa raiz. Priorize campos que aparecem em muitos itens e valide se foram alterados pelo upgrade/template/importação.", [{"field": k, "count": v} for k, v in fields.most_common(10)], "items")
-
-        n = _scalar(conn, "SELECT COUNT(*) FROM anomalies WHERE category='RTDATA_MISSING'")
-        add("P2", "RTDATA_MISSING", "Validar itens sem runtime data", n,
-            "O comparador não encontrou estado runtime equivalente no novo ambiente para itens que estavam saudáveis no baseline.",
-            "Valide se o server/proxy já processou esses itens, se a configuração foi carregada e se houve tempo suficiente para a primeira coleta após a migração.", None, "items")
-
-        n = _scalar(conn, "SELECT COALESCE(SUM(pending_disable_count + disabled_count),0) FROM lld_summary")
-        add("P2", "LLD_DISABLED_CHILDREN", "Revisar filhos LLD desabilitados", n,
-            "Parte dos filhos do baseline deixou de estar operacional no Zabbix 7 mesmo permanecendo presente.",
-            "Confirme overrides, política de lost resources e mudanças de prototype antes de reabilitar manualmente. Prefira corrigir a regra/prototype quando o padrão for massivo.", None, "lld")
+            "Use as diferenças como pista de causa raiz, sobretudo key_, type, interfaceid e master_itemid.", [{"field": k, "count": v} for k, v in fields.most_common(10)], "items")
 
     recs.sort(key=lambda x: ({"P0": 0, "P1": 1, "P2": 2}.get(x["priority"], 9), -x["count"]))
     return {"rows": recs, "count": len(recs)}
@@ -395,7 +474,6 @@ def api_filters(db_path: Path) -> dict[str, Any]:
             "item_categories": [r[0] for r in conn.execute("SELECT DISTINCT category FROM anomalies ORDER BY category")],
             "lld_categories": [r[0] for r in conn.execute("SELECT DISTINCT category FROM lld_summary WHERE category<>'OK' ORDER BY category")],
             "lld_rule_categories": [r[0] for r in conn.execute("SELECT DISTINCT category FROM lld_rule_anomalies ORDER BY category")],
-            "hosts": _rows(conn.execute("SELECT DISTINCT hostid,host,host_name FROM anomalies ORDER BY COALESCE(NULLIF(host_name,''),host) LIMIT 5000")),
             "templates": _rows(conn.execute("SELECT template_hostid,template_host,template_name,rank FROM template_summary ORDER BY rank LIMIT 5000")),
         }
 
@@ -437,28 +515,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         try:
-            if parsed.path == "/api/overview":
-                return self._send_json(api_overview(self.db_path))
-            if parsed.path == "/api/charts":
-                return self._send_json(api_charts(self.db_path))
-            if parsed.path == "/api/items":
-                return self._send_json(api_items(self.db_path, params))
-            if parsed.path == "/api/lld":
-                return self._send_json(api_lld(self.db_path, params))
-            if parsed.path == "/api/lld-rules":
-                return self._send_json(api_lld_rules(self.db_path, params))
-            if parsed.path == "/api/hosts":
-                return self._send_json(api_hosts(self.db_path, params))
-            if parsed.path == "/api/templates":
-                return self._send_json(api_templates(self.db_path, params))
-            if parsed.path == "/api/roots":
-                return self._send_json(api_roots(self.db_path))
-            if parsed.path == "/api/recommendations":
-                return self._send_json(api_recommendations(self.db_path))
-            if parsed.path == "/api/filters":
-                return self._send_json(api_filters(self.db_path))
-            if parsed.path == "/api/health":
-                return self._send_json({"status": "ok", "database": self.db_path.name})
+            routes = {
+                "/api/overview": lambda: api_overview(self.db_path),
+                "/api/charts": lambda: api_charts(self.db_path),
+                "/api/items": lambda: api_items(self.db_path, params),
+                "/api/lld": lambda: api_lld(self.db_path, params),
+                "/api/lld-rules": lambda: api_lld_rules(self.db_path, params),
+                "/api/hosts": lambda: api_hosts(self.db_path, params),
+                "/api/interface-hosts": lambda: api_interface_hosts(self.db_path, params),
+                "/api/templates": lambda: api_templates(self.db_path, params),
+                "/api/roots": lambda: api_roots(self.db_path, params),
+                "/api/recommendations": lambda: api_recommendations(self.db_path),
+                "/api/filters": lambda: api_filters(self.db_path),
+                "/api/health": lambda: {"status": "ok", "database": self.db_path.name},
+            }
+            if parsed.path in routes:
+                return self._send_json(routes[parsed.path]())
             if parsed.path in ("/", "/index.html"):
                 return self._send_file(self.static_dir / "index.html")
             rel = parsed.path.lstrip("/")
@@ -479,11 +551,15 @@ def serve(results_db: str | Path, host: str = "127.0.0.1", port: int = 8088) -> 
     if not db_path.exists():
         raise FileNotFoundError(f"Banco de comparação não encontrado: {db_path}")
     with _conn(db_path) as conn:
-        required = {"metadata", "anomalies", "lld_summary", "lld_rule_anomalies", "host_summary", "template_summary"}
+        required = {"metadata", "anomalies", "lld_summary", "lld_rule_anomalies", "host_summary", "template_summary", "current_host_interfaces", "host_interface_failures"}
         existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         missing = required - existing
         if missing:
-            raise RuntimeError("Arquivo não está enriquecido para o frontend atual; tabelas ausentes: " + ", ".join(sorted(missing)) + ". Para resultados v0.2, execute o comando enrich-templates com o snapshot do Zabbix 6.")
+            raise RuntimeError("Arquivo incompleto para o frontend: " + ", ".join(sorted(missing)))
+        anomaly_cols = {r[1] for r in conn.execute("PRAGMA table_info(anomalies)")}
+        needed = {"baseline_item_type", "current_item_type", "current_key_", "current_item_name"}
+        if not needed.issubset(anomaly_cols):
+            raise RuntimeError("Este comparison_results.sqlite foi gerado por uma versão anterior. Reexecute apenas o comando compare com a v0.4.1 usando o mesmo snapshot do Zabbix 6; não é necessário refazer o snapshot.")
 
     static_dir = Path(__file__).with_name("webapp")
     handler = type("BoundDashboardHandler", (DashboardHandler,), {"db_path": db_path, "static_dir": static_dir})

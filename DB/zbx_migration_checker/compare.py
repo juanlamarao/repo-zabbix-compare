@@ -14,6 +14,7 @@ from .db import MySQLDatabase, chunks
 from .logic import classify_item, classify_lld_rule, loss_severity, structural_diff
 from .snapshot import DISCOVERY_COLUMNS, ITEM_COLUMNS, open_sqlite, read_metadata
 from .templates import enrich_template_groups
+from .audit import write_audit
 
 LOG = logging.getLogger(__name__)
 
@@ -26,6 +27,8 @@ ANOMALY_COLUMNS = [
     "current_item_status", "baseline_interface_available", "current_interface_available",
     "current_interface_error", "baseline_proxy_ref", "current_proxy_ref", "master_itemid",
     "master_anomaly_itemid", "master_anomaly_category", "dependent_affected_count", "changed_fields",
+    "baseline_item_type", "current_item_type", "current_item_name", "current_key_",
+    "current_hostid", "current_host", "current_host_name",
 ]
 
 LLD_RULE_COLUMNS = [
@@ -64,6 +67,31 @@ def _create_results_db(path: Path, baseline_path: Path, force: bool) -> sqlite3.
             proxy_ref INTEGER
         );
 
+        CREATE TABLE current_host_interfaces (
+            interfaceid INTEGER PRIMARY KEY,
+            hostid INTEGER,
+            interface_type INTEGER,
+            interface_main INTEGER,
+            interface_useip INTEGER,
+            interface_ip TEXT,
+            interface_dns TEXT,
+            interface_port TEXT,
+            interface_available INTEGER,
+            interface_error TEXT,
+            is_failure INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX idx_current_host_interfaces_host ON current_host_interfaces(hostid);
+
+        CREATE TABLE host_interface_failures (
+            hostid INTEGER PRIMARY KEY,
+            host TEXT,
+            host_name TEXT,
+            proxy_ref INTEGER,
+            interface_count INTEGER,
+            failing_interface_count INTEGER,
+            errors_summary TEXT
+        );
+
         CREATE TABLE anomalies (
             itemid INTEGER PRIMARY KEY,
             hostid INTEGER,
@@ -87,7 +115,14 @@ def _create_results_db(path: Path, baseline_path: Path, force: bool) -> sqlite3.
             master_anomaly_itemid INTEGER,
             master_anomaly_category TEXT,
             dependent_affected_count INTEGER DEFAULT 0,
-            changed_fields TEXT
+            changed_fields TEXT,
+            baseline_item_type INTEGER,
+            current_item_type INTEGER,
+            current_item_name TEXT,
+            current_key_ TEXT,
+            current_hostid INTEGER,
+            current_host TEXT,
+            current_host_name TEXT
         );
         CREATE INDEX idx_anomalies_host ON anomalies(hostid);
         CREATE INDEX idx_anomalies_category ON anomalies(category);
@@ -217,9 +252,37 @@ def _load_current_baseline_objects(
     disc_insert = f"INSERT OR REPLACE INTO current_discovery ({','.join(DISCOVERY_COLUMNS)}) VALUES ({','.join(['?'] * len(DISCOVERY_COLUMNS))})"
 
     processed = 0
+    recovered_by_presence = 0
+    unresolved_fetch = 0
     item_ids = _iter_sqlite_ids(conn, "SELECT itemid FROM baseline.items ORDER BY itemid")
     for ids in chunks(item_ids, report_cfg.batch_size):
         rows = db.fetch_items(ids)
+        found = {int(r["itemid"]) for r in rows}
+        missing_from_rich_fetch = [iid for iid in ids if int(iid) not in found]
+        if missing_from_rich_fetch:
+            # Integrity guard: item existence is checked directly against items.
+            # If an item exists there, it must never be classified ITEM_MISSING.
+            presence = db.fetch_item_presence(missing_from_rich_fetch)
+            recover_ids = sorted(presence)
+            if recover_ids:
+                recovered_rows = db.fetch_items(recover_ids)
+                rows.extend(recovered_rows)
+                recovered_ids_found = {int(r["itemid"]) for r in recovered_rows}
+                recovered_by_presence += len(recovered_ids_found)
+                still = set(recover_ids) - recovered_ids_found
+                if still:
+                    unresolved_fetch += len(still)
+                    LOG.error("Itens existem em items, mas falharam no fetch detalhado: %s", sorted(still)[:20])
+                    # Absolute guard against false ITEM_MISSING: if the direct
+                    # presence query proved the row exists in items, persist a
+                    # minimal current row. It may become RTDATA_MISSING, but it
+                    # can never be reported as absent.
+                    for iid in sorted(still):
+                        p = presence[iid]
+                        fallback = {c: None for c in ITEM_COLUMNS}
+                        for key in ("itemid","hostid","item_status","flags","item_type","value_type","key_","name","interfaceid","master_itemid","templateid","host","host_name","host_status"):
+                            fallback[key] = p.get(key)
+                        rows.append(fallback)
         if rows:
             conn.executemany(item_insert, [tuple(row.get(c) for c in ITEM_COLUMNS) for row in rows])
         disc_rows = db.fetch_discovery(ids)
@@ -244,6 +307,76 @@ def _load_current_baseline_objects(
         processed_hosts += len(ids)
     LOG.info("Zabbix 7: %s hosts do baseline verificados", f"{processed_hosts:,}")
 
+    # Host-wide interface health is evaluated independently from item data.
+    # A host is isolated from the regression report only when it is enabled,
+    # has at least one interface, and every interface is failing.
+    interface_insert = """
+        INSERT OR REPLACE INTO current_host_interfaces(
+            interfaceid,hostid,interface_type,interface_main,interface_useip,interface_ip,interface_dns,
+            interface_port,interface_available,interface_error,is_failure
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """
+    interface_rows = 0
+    host_ids = _iter_sqlite_ids(conn, "SELECT DISTINCT hostid FROM baseline.items WHERE hostid IS NOT NULL ORDER BY hostid")
+    for ids in chunks(host_ids, report_cfg.batch_size):
+        rows = db.fetch_host_interfaces(ids)
+        if rows:
+            payload = []
+            for r in rows:
+                err = (r.get("interface_error") or "").strip()
+                available = r.get("interface_available")
+                is_failure = 1 if err or available == 2 else 0
+                payload.append((
+                    r.get("interfaceid"), r.get("hostid"), r.get("interface_type"), r.get("interface_main"),
+                    r.get("interface_useip"), r.get("interface_ip"), r.get("interface_dns"), r.get("interface_port"),
+                    available, r.get("interface_error"), is_failure,
+                ))
+            conn.executemany(interface_insert, payload)
+            interface_rows += len(payload)
+        conn.commit()
+
+    conn.execute("DELETE FROM host_interface_failures")
+    conn.execute("""
+        INSERT INTO host_interface_failures(
+            hostid,host,host_name,proxy_ref,interface_count,failing_interface_count,errors_summary
+        )
+        SELECT
+            ch.hostid, ch.host, ch.host_name, ch.proxy_ref,
+            COUNT(i.interfaceid) AS interface_count,
+            SUM(i.is_failure) AS failing_interface_count,
+            GROUP_CONCAT(
+                CASE WHEN i.is_failure=1 THEN
+                    ('#' || i.interfaceid || ': ' || COALESCE(NULLIF(TRIM(i.interface_error),''),
+                        CASE WHEN i.interface_available=2 THEN 'Interface indisponível' ELSE 'Erro de interface' END))
+                END,
+                ' | '
+            ) AS errors_summary
+        FROM current_hosts ch
+        JOIN current_host_interfaces i ON i.hostid=ch.hostid
+        WHERE ch.host_status=0
+        GROUP BY ch.hostid,ch.host,ch.host_name,ch.proxy_ref
+        HAVING COUNT(i.interfaceid)>0 AND SUM(i.is_failure)=COUNT(i.interfaceid)
+    """)
+    conn.commit()
+    interface_failure_hosts = conn.execute("SELECT COUNT(*) FROM host_interface_failures").fetchone()[0]
+    _metadata(conn, "current_host_interface_rows", interface_rows)
+    _metadata(conn, "ignored_all_interfaces_failed_hosts", int(interface_failure_hosts))
+    LOG.info(
+        "Interfaces: %s interfaces avaliadas; %s hosts habilitados com 100%% das interfaces em erro foram isolados do report",
+        f"{interface_rows:,}", f"{interface_failure_hosts:,}"
+    )
+
+    ignored_disabled_hosts = conn.execute("""
+        SELECT COUNT(DISTINCT ch.hostid)
+        FROM current_hosts ch
+        JOIN baseline.items b ON b.hostid=ch.hostid
+        WHERE b.host_status=0 AND COALESCE(ch.host_status,0)<>0
+    """).fetchone()[0]
+    _metadata(conn, "ignored_current_disabled_hosts", int(ignored_disabled_hosts))
+    _metadata(conn, "current_fetch_recovered_by_presence", recovered_by_presence)
+    _metadata(conn, "current_fetch_unresolved_existing_items", unresolved_fetch)
+    conn.commit()
+
 
 def _current_alias_select(prefix: str = "c_") -> str:
     return ", ".join(f"c.`{col}` AS `{prefix}{col}`" for col in ITEM_COLUMNS)
@@ -257,7 +390,7 @@ def _row_to_current(row: sqlite3.Row, prefix: str = "c_") -> dict[str, Any] | No
 
 def _analyze_items(conn: sqlite3.Connection) -> int:
     sql = f"""
-        SELECT b.*, {_current_alias_select()}, ch.hostid AS current_host_exists
+        SELECT b.*, {_current_alias_select()}, ch.hostid AS current_host_exists, ch.host_status AS current_baseline_host_status
         FROM baseline.items b
         LEFT JOIN current_items c ON c.itemid = b.itemid
         LEFT JOIN current_hosts ch ON ch.hostid = b.hostid
@@ -265,6 +398,7 @@ def _analyze_items(conn: sqlite3.Connection) -> int:
           AND b.item_status = 0
           AND b.rt_state = 0
           AND b.flags IN (0, 4)
+          AND NOT EXISTS (SELECT 1 FROM host_interface_failures hf WHERE hf.hostid=b.hostid)
         ORDER BY b.itemid
     """
     insert_sql = f"INSERT INTO anomalies ({','.join(ANOMALY_COLUMNS)}) VALUES ({','.join(['?'] * len(ANOMALY_COLUMNS))})"
@@ -276,16 +410,21 @@ def _analyze_items(conn: sqlite3.Connection) -> int:
     for row in cur:
         b = {col: row[col] for col in ITEM_COLUMNS}
         c = _row_to_current(row)
+        if row["current_baseline_host_status"] is not None and row["current_baseline_host_status"] != 0:
+            analyzed += 1
+            continue
         category, severity = classify_item(b, c, current_host_exists=row["current_host_exists"] is not None)
         analyzed += 1
-        if category == "OK":
+        if category in ("OK", "IGNORE_HOST_DISABLED"):
             continue
 
         changed = structural_diff(b, c) if c else []
         current_error = None
         current_if_error = None
         if c:
-            current_error = c.get("rt_error") or c.get("interface_error")
+            # Never mix interface-level errors into the item runtime error.
+            # current_error must correspond strictly to this itemid.
+            current_error = c.get("rt_error")
             current_if_error = c.get("interface_error")
         master_itemid = c.get("master_itemid") if c is not None else b.get("master_itemid")
         values = {
@@ -312,6 +451,13 @@ def _analyze_items(conn: sqlite3.Connection) -> int:
             "master_anomaly_category": None,
             "dependent_affected_count": 0,
             "changed_fields": ",".join(changed),
+            "baseline_item_type": b.get("item_type"),
+            "current_item_type": c.get("item_type") if c else None,
+            "current_item_name": c.get("name") if c else None,
+            "current_key_": c.get("key_") if c else None,
+            "current_hostid": c.get("hostid") if c else None,
+            "current_host": c.get("host") if c else None,
+            "current_host_name": c.get("host_name") if c else None,
         }
         batch.append(tuple(values[col] for col in ANOMALY_COLUMNS))
         anomaly_count += 1
@@ -332,7 +478,7 @@ def _analyze_items(conn: sqlite3.Connection) -> int:
 
 def _analyze_lld_rules(conn: sqlite3.Connection) -> int:
     sql = f"""
-        SELECT b.*, {_current_alias_select()}, ch.hostid AS current_host_exists
+        SELECT b.*, {_current_alias_select()}, ch.hostid AS current_host_exists, ch.host_status AS current_baseline_host_status
         FROM baseline.items b
         LEFT JOIN current_items c ON c.itemid = b.itemid
         LEFT JOIN current_hosts ch ON ch.hostid = b.hostid
@@ -340,6 +486,7 @@ def _analyze_lld_rules(conn: sqlite3.Connection) -> int:
           AND b.item_status = 0
           AND b.rt_state = 0
           AND b.flags = 1
+          AND NOT EXISTS (SELECT 1 FROM host_interface_failures hf WHERE hf.hostid=b.hostid)
         ORDER BY b.itemid
     """
     insert_sql = f"INSERT INTO lld_rule_anomalies ({','.join(LLD_RULE_COLUMNS)}) VALUES ({','.join(['?'] * len(LLD_RULE_COLUMNS))})"
@@ -350,9 +497,12 @@ def _analyze_lld_rules(conn: sqlite3.Connection) -> int:
     for row in conn.execute(sql):
         b = {col: row[col] for col in ITEM_COLUMNS}
         c = _row_to_current(row)
+        if row["current_baseline_host_status"] is not None and row["current_baseline_host_status"] != 0:
+            analyzed += 1
+            continue
         category, severity = classify_lld_rule(b, c, current_host_exists=row["current_host_exists"] is not None)
         analyzed += 1
-        if category == "OK":
+        if category in ("OK", "IGNORE_LLD_HOST_DISABLED"):
             continue
         changed = structural_diff(b, c) if c else []
         values = {
@@ -366,7 +516,7 @@ def _analyze_lld_rules(conn: sqlite3.Connection) -> int:
             "severity": severity,
             "baseline_rt_state": b["rt_state"],
             "current_rt_state": c.get("rt_state") if c else None,
-            "current_error": (c.get("rt_error") or c.get("interface_error")) if c else None,
+            "current_error": c.get("rt_error") if c else None,
             "baseline_item_status": b["item_status"],
             "current_item_status": c.get("item_status") if c else None,
             "changed_fields": ",".join(changed),
@@ -448,13 +598,17 @@ def _build_lld_child_details(conn: sqlite3.Connection) -> int:
         JOIN baseline.items b ON b.itemid = m.itemid
         LEFT JOIN current_items c ON c.itemid = m.itemid
         LEFT JOIN current_discovery cd ON cd.itemid = m.itemid
-        WHERE
+        LEFT JOIN current_hosts ch ON ch.hostid = b.hostid
+        WHERE (ch.hostid IS NULL OR ch.host_status = 0)
+          AND NOT EXISTS (SELECT 1 FROM host_interface_failures hf WHERE hf.hostid=b.hostid)
+          AND (
             c.itemid IS NULL
             OR cd.itemid IS NULL
             OR COALESCE(cd.discovery_status,0) = 1
             OR COALESCE(cd.ts_delete,0) > 0
             OR (m.baseline_item_status = 0 AND c.item_status <> 0)
             OR (m.baseline_item_status = 0 AND COALESCE(cd.ts_disable,0) > 0)
+          )
         """
     )
     conn.commit()
@@ -506,8 +660,12 @@ def _analyze_lld_counts(conn: sqlite3.Connection, report_cfg: ReportConfig) -> i
                 AND COALESCE(cd.ts_disable,0) > 0
                 THEN 1 ELSE 0 END) AS pending_disable_count
         FROM lld_baseline_map m
+        JOIN baseline.items bi ON bi.itemid = m.itemid
         LEFT JOIN current_items c ON c.itemid = m.itemid
         LEFT JOIN current_discovery cd ON cd.itemid = m.itemid
+        LEFT JOIN current_hosts ch ON ch.hostid = bi.hostid
+        WHERE (ch.hostid IS NULL OR ch.host_status = 0)
+          AND NOT EXISTS (SELECT 1 FROM host_interface_failures hf WHERE hf.hostid=bi.hostid)
         GROUP BY m.group_id
         ORDER BY m.group_id
     """
@@ -662,6 +820,8 @@ def export_csvs(conn: sqlite3.Connection, output_dir: Path, write_lld_child_deta
     _write_csv(conn, "lld_rule_anomalies", output_dir / "lld_rule_regressions.csv", order_by="CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 WHEN 'WARNING' THEN 1 ELSE 0 END DESC, host, itemid")
     _write_csv(conn, "lld_summary", output_dir / "lld_loss_summary.csv", order_by="CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 WHEN 'WARNING' THEN 1 ELSE 0 END DESC, loss_pct DESC")
     _write_csv(conn, "host_summary", output_dir / "host_summary.csv", order_by="anomaly_count DESC")
+    _write_csv(conn, "host_interface_failures", output_dir / "host_interface_failures.csv", order_by="host_name,host")
+    _write_csv(conn, "current_host_interfaces", output_dir / "host_interface_failure_details.csv", where="hostid IN (SELECT hostid FROM host_interface_failures)", order_by="hostid,interfaceid")
     _write_csv(conn, "template_summary", output_dir / "template_summary.csv", order_by="rank ASC")
     if write_lld_child_details:
         _write_csv(conn, "lld_child_anomalies", output_dir / "lld_child_anomalies.csv", order_by="ruleid, reason, itemid")
@@ -718,12 +878,13 @@ def compare_snapshot_to_current(
 
         summary = {
             "baseline_item_count": conn.execute("SELECT COUNT(*) FROM baseline.items").fetchone()[0],
-            "baseline_healthy_items_analyzed": conn.execute("SELECT COUNT(*) FROM baseline.items WHERE host_status=0 AND item_status=0 AND rt_state=0 AND flags IN (0,4)").fetchone()[0],
+            "baseline_healthy_items_analyzed": json.loads(conn.execute("SELECT value FROM metadata WHERE key='baseline_healthy_items_analyzed'").fetchone()[0]),
             "item_regressions": conn.execute("SELECT COUNT(*) FROM anomalies").fetchone()[0],
             "lld_rule_regressions": conn.execute("SELECT COUNT(*) FROM lld_rule_anomalies").fetchone()[0],
             "lld_groups_with_loss": conn.execute("SELECT COUNT(*) FROM lld_summary WHERE category <> 'OK'").fetchone()[0],
             "lld_total_loss": conn.execute("SELECT COUNT(*) FROM lld_summary WHERE category='LLD_TOTAL_LOSS'").fetchone()[0],
             "hosts_impacted": conn.execute("SELECT COUNT(DISTINCT hostid) FROM anomalies").fetchone()[0],
+            "hosts_all_interfaces_failed": conn.execute("SELECT COUNT(*) FROM host_interface_failures").fetchone()[0],
             "templates_impacted": conn.execute("SELECT COUNT(*) FROM template_summary").fetchone()[0],
             "categories": {row[0]: row[1] for row in conn.execute("SELECT category,COUNT(*) FROM anomalies GROUP BY category ORDER BY COUNT(*) DESC")},
             "lld_rule_categories": {row[0]: row[1] for row in conn.execute("SELECT category,COUNT(*) FROM lld_rule_anomalies GROUP BY category ORDER BY COUNT(*) DESC")},
@@ -737,5 +898,6 @@ def compare_snapshot_to_current(
     finally:
         conn.close()
 
+    write_audit(result_db, output / "integrity_audit.json")
     LOG.info("Comparação concluída: %s", output)
     return result_db, summary
