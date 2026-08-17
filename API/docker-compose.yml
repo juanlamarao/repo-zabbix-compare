@@ -1,0 +1,67 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-zuv}
+      POSTGRES_USER: ${POSTGRES_USER:-zuv}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zuv}
+    volumes:
+      - zuv_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zuv} -d ${POSTGRES_DB:-zuv}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-zuv}:${POSTGRES_PASSWORD:-zuv}@db:5432/${POSTGRES_DB:-zuv}
+      OLD_ZABBIX_URL: ${OLD_ZABBIX_URL}
+      OLD_ZABBIX_TOKEN: ${OLD_ZABBIX_TOKEN}
+      NEW_ZABBIX_URL: ${NEW_ZABBIX_URL}
+      NEW_ZABBIX_TOKEN: ${NEW_ZABBIX_TOKEN}
+      VERIFY_SSL: ${VERIFY_SSL:-true}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-90}
+      API_RETRIES: ${API_RETRIES:-3}
+      HOSTS_PER_BATCH: ${HOSTS_PER_BATCH:-5}
+      PARALLEL_BATCHES: ${PARALLEL_BATCHES:-5}
+      COLLECTION_INTERVAL_SECONDS: ${COLLECTION_INTERVAL_SECONDS:-300}
+      ACTION_ALERT_SCAN_LIMIT: ${ACTION_ALERT_SCAN_LIMIT:-100}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-zuv}:${POSTGRES_PASSWORD:-zuv}@db:5432/${POSTGRES_DB:-zuv}
+      OLD_ZABBIX_URL: ${OLD_ZABBIX_URL}
+      OLD_ZABBIX_TOKEN: ${OLD_ZABBIX_TOKEN}
+      NEW_ZABBIX_URL: ${NEW_ZABBIX_URL}
+      NEW_ZABBIX_TOKEN: ${NEW_ZABBIX_TOKEN}
+      VERIFY_SSL: ${VERIFY_SSL:-true}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-90}
+      API_RETRIES: ${API_RETRIES:-3}
+      HOSTS_PER_BATCH: ${HOSTS_PER_BATCH:-5}
+      PARALLEL_BATCHES: ${PARALLEL_BATCHES:-5}
+      COLLECTION_INTERVAL_SECONDS: ${COLLECTION_INTERVAL_SECONDS:-300}
+      ACTION_ALERT_SCAN_LIMIT: ${ACTION_ALERT_SCAN_LIMIT:-100}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "${PORT:-8080}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  zuv_db:

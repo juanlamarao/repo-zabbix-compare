@@ -1,0 +1,33 @@
+baseline:
+  host: zabbix6-db.example.local
+  port: 3306
+  database: zabbix
+  user: zbx_compare_ro
+  password_env: ZBX6_DB_PASSWORD
+  connect_timeout: 10
+  read_timeout: 600
+  # ssl_ca: /run/secrets/mysql-ca.pem
+
+# Pode remover esta seção enquanto o Zabbix 7 ainda não estiver disponível.
+current:
+  host: zabbix7-db.example.local
+  port: 3306
+  database: zabbix
+  user: zbx_compare_ro
+  password_env: ZBX7_DB_PASSWORD
+  connect_timeout: 10
+  read_timeout: 600
+  # ssl_ca: /run/secrets/mysql-ca.pem
+
+report:
+  # Perda de filhos do LLD, considerando somente IDs existentes no baseline 6.
+  warning_loss_pct: 20
+  high_loss_pct: 50
+  min_absolute_loss: 10
+
+  # 5000 costuma ser um bom compromisso para ambientes grandes.
+  batch_size: 5000
+
+  # O HTML mostra só uma amostra; os CSVs mantêm todos os registros.
+  html_row_limit: 500
+  write_lld_child_details: true

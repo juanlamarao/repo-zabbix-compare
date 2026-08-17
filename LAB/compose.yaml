@@ -1,0 +1,156 @@
+name: zabbix-upgrade-lab
+
+services:
+  db6:
+    image: mysql:8.0
+    container_name: zbx-lab-db6
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --log-bin-trust-function-creators=1
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-zabbix}
+      MYSQL_USER: ${MYSQL_USER:-zabbix}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-zabbix_lab}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_lab}
+    volumes:
+      - db6_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    networks: [zbxlab]
+    restart: unless-stopped
+
+  zabbix-server6:
+    image: zabbix/zabbix-server-mysql:6.0-ubuntu-latest
+    container_name: zbx-lab-server6
+    environment:
+      DB_SERVER_HOST: db6
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-zabbix}
+      MYSQL_USER: ${MYSQL_USER:-zabbix}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-zabbix_lab}
+      ZBX_STARTPOLLERS: 10
+      ZBX_STARTTRAPPERS: 10
+      ZBX_CACHESIZE: 128M
+      ZBX_HISTORYCACHESIZE: 64M
+      ZBX_HISTORYINDEXCACHESIZE: 32M
+      ZBX_TRENDCACHESIZE: 32M
+      ZBX_VALUECACHESIZE: 64M
+    depends_on:
+      db6:
+        condition: service_healthy
+    ports:
+      - "10061:10051"
+    networks: [zbxlab]
+    restart: unless-stopped
+
+  zabbix-web6:
+    image: zabbix/zabbix-web-nginx-mysql:6.0-ubuntu-latest
+    container_name: zbx-lab-web6
+    environment:
+      DB_SERVER_HOST: db6
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-zabbix}
+      MYSQL_USER: ${MYSQL_USER:-zabbix}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-zabbix_lab}
+      ZBX_SERVER_HOST: zabbix-server6
+      ZBX_SERVER_NAME: Zabbix 6 Lab
+      PHP_TZ: ${TZ:-America/Sao_Paulo}
+    depends_on:
+      db6:
+        condition: service_healthy
+      zabbix-server6:
+        condition: service_started
+    ports:
+      - "8086:8080"
+    networks: [zbxlab]
+    restart: unless-stopped
+
+  zabbix-agent6:
+    image: zabbix/zabbix-agent2:6.0-ubuntu-latest
+    container_name: zbx-lab-agent6
+    environment:
+      ZBX_HOSTNAME: lab-agent
+      ZBX_SERVER_HOST: zabbix-server6,zabbix-server7
+    networks: [zbxlab]
+    restart: unless-stopped
+
+  # Zabbix 7 is intentionally behind the "z7" profile.
+  # Start db7 first, clone db6 into it, then start server7/web7.
+  db7:
+    image: mysql:8.0
+    container_name: zbx-lab-db7
+    profiles: ["z7"]
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --log-bin-trust-function-creators=1
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-zabbix}
+      MYSQL_USER: ${MYSQL_USER:-zabbix}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-zabbix_lab}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_lab}
+    volumes:
+      - db7_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    networks: [zbxlab]
+    restart: unless-stopped
+
+  zabbix-server7:
+    image: zabbix/zabbix-server-mysql:7.0-ubuntu-latest
+    container_name: zbx-lab-server7
+    profiles: ["z7"]
+    environment:
+      DB_SERVER_HOST: db7
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-zabbix}
+      MYSQL_USER: ${MYSQL_USER:-zabbix}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-zabbix_lab}
+      ZBX_STARTPOLLERS: 10
+      ZBX_STARTTRAPPERS: 10
+      ZBX_CACHESIZE: 128M
+      ZBX_HISTORYCACHESIZE: 64M
+      ZBX_HISTORYINDEXCACHESIZE: 32M
+      ZBX_TRENDCACHESIZE: 32M
+      ZBX_VALUECACHESIZE: 64M
+    depends_on:
+      db7:
+        condition: service_healthy
+    ports:
+      - "10071:10051"
+    networks: [zbxlab]
+    restart: unless-stopped
+
+  zabbix-web7:
+    image: zabbix/zabbix-web-nginx-mysql:7.0-ubuntu-latest
+    container_name: zbx-lab-web7
+    profiles: ["z7"]
+    environment:
+      DB_SERVER_HOST: db7
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-zabbix}
+      MYSQL_USER: ${MYSQL_USER:-zabbix}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-zabbix_lab}
+      ZBX_SERVER_HOST: zabbix-server7
+      ZBX_SERVER_NAME: Zabbix 7 Lab
+      PHP_TZ: ${TZ:-America/Sao_Paulo}
+    depends_on:
+      db7:
+        condition: service_healthy
+      zabbix-server7:
+        condition: service_started
+    ports:
+      - "8087:8080"
+    networks: [zbxlab]
+    restart: unless-stopped
+
+networks:
+  zbxlab:
+    name: zabbix-upgrade-lab-net
+
+volumes:
+  db6_data:
+  db7_data:

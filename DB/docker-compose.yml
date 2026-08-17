@@ -1,0 +1,10 @@
+services:
+  checker:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - ./data:/app/data
+      - ./reports:/app/reports
+    command: ["validate", "--config", "/app/config.yml"]
